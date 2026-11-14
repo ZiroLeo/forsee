@@ -41,6 +41,7 @@ from database import (
     log_event,
 )
 from utils import rate_limiter
+import ui
 
 
 logger = logging.getLogger(__name__)
@@ -161,43 +162,15 @@ async def safe_edit_message(
     text: str,
     reply_markup: InlineKeyboardMarkup | None = None,
 ):
-    """ویرایش امن پیام و جلوگیری از خطای message is not modified."""
+    """
+    نمایش صفحه‌ی کیف پول.
 
-    message = callback.message
+    اگر کلیک از روی پیام اصلی (Rich) باشد، پیام جدید ارسال می‌شود
+    و پیام اصلی ویرایش نمی‌شود؛ در غیر این صورت پیام Inline فعلی
+    ویرایش می‌شود.
+    """
 
-    if not isinstance(message, Message):
-        return
-
-    try:
-        await message.edit_text(
-            text,
-            reply_markup=reply_markup,
-        )
-
-    except TelegramBadRequest as error:
-        if "message is not modified" in str(error).lower():
-            return
-
-        logger.exception("Telegram rejected wallet message edit.")
-
-        try:
-            await message.answer(
-                text,
-                reply_markup=reply_markup,
-            )
-        except Exception:
-            logger.exception("Could not send replacement wallet message.")
-
-    except Exception:
-        logger.exception("Unexpected error while editing wallet message.")
-
-        try:
-            await message.answer(
-                text,
-                reply_markup=reply_markup,
-            )
-        except Exception:
-            logger.exception("Could not send replacement wallet message.")
+    await ui.show(callback, text, reply_markup)
 
 
 async def answer_callback(
@@ -216,7 +189,7 @@ async def answer_callback(
 def premium_emoji(key: str) -> str:
     """نمایش Premium Emoji در متن پیام با HTML تلگرام."""
     emoji_id = WALLET_EMOJI_IDS[key]
-    return f"<tg-emoji emoji-id='{emoji_id}'>◉</tg-emoji>"
+    return f"<tg-emoji emoji-id='{emoji_id}'>⭐</tg-emoji>"
 
 
 def get_wallet_text(user_id: int) -> str:
@@ -264,7 +237,7 @@ async def show_wallet(
 
         if isinstance(callback.message, Message):
             await callback.message.answer(
-                "<tg-emoji emoji-id='5440681540541502133'>◉</tg-emoji> در حال حاضر امکان نمایش کیف پول وجود ندارد. لطفاً کمی بعد دوباره تلاش کنید."
+                "<tg-emoji emoji-id='5440681540541502133'>⭐</tg-emoji> در حال حاضر امکان نمایش کیف پول وجود ندارد. لطفاً کمی بعد دوباره تلاش کنید."
             )
 
 
@@ -290,13 +263,13 @@ async def show_wallet_history(
 
         if not transactions:
             text = (
-                "<tg-emoji emoji-id='5827691921073512783'>◉</tg-emoji> <b>تاریخچه تراکنش‌ها</b>\n\n"
+                "<tg-emoji emoji-id='5827691921073512783'>⭐</tg-emoji> <b>تاریخچه تراکنش‌ها</b>\n\n"
                 "هنوز هیچ تراکنشی برای حساب شما ثبت نشده است."
             )
 
         else:
             lines = [
-                "<tg-emoji emoji-id='5827691921073512783'>◉</tg-emoji> <b>۱۰ تراکنش آخر کیف پول</b>\n"
+                "<tg-emoji emoji-id='5827691921073512783'>⭐</tg-emoji> <b>۱۰ تراکنش آخر کیف پول</b>\n"
             ]
 
             for tx in transactions:
@@ -327,7 +300,7 @@ async def show_wallet_history(
 
         if isinstance(callback.message, Message):
             await callback.message.answer(
-                "<tg-emoji emoji-id='5440681540541502133'>◉</tg-emoji> دریافت تاریخچه تراکنش‌ها با مشکل مواجه شد."
+                "<tg-emoji emoji-id='5440681540541502133'>⭐</tg-emoji> دریافت تاریخچه تراکنش‌ها با مشکل مواجه شد."
             )
 
 
@@ -348,7 +321,7 @@ async def start_wallet_charge(
 
     if not rate_limiter.is_allowed(user.id):
         await callback.answer(
-            "<tg-emoji emoji-id='5827691921073512783'>◉</tg-emoji> لطفاً کمی صبر کنید و دوباره تلاش کنید.",
+            "<tg-emoji emoji-id='5827691921073512783'>⭐</tg-emoji> لطفاً کمی صبر کنید و دوباره تلاش کنید.",
             show_alert=True,
         )
         return
@@ -357,11 +330,11 @@ async def start_wallet_charge(
     await state.set_state(WalletStates.waiting_amount)
 
     text = (
-        "<tg-emoji emoji-id='5211047317309767043'>◉</tg-emoji> <b>شارژ کیف پول</b>\n\n"
+        "<tg-emoji emoji-id='5211047317309767043'>⭐</tg-emoji> <b>شارژ کیف پول</b>\n\n"
         "مرحله ۱ از ۳: <b>انتخاب مبلغ</b>\n\n"
         "مبلغ موردنظر خود را به تومان وارد کنید.\n\n"
-        f"<tg-emoji emoji-id='5244609046459228264'>◉</tg-emoji> حداقل مبلغ: <b>{MIN_AMOUNT:,} تومان</b>\n"
-        f"<tg-emoji emoji-id='5244609046459228264'>◉</tg-emoji> حداکثر مبلغ: <b>{MAX_AMOUNT:,} تومان</b>\n\n"
+        f"<tg-emoji emoji-id='5244609046459228264'>⭐</tg-emoji> حداقل مبلغ: <b>{MIN_AMOUNT:,} تومان</b>\n"
+        f"<tg-emoji emoji-id='5244609046459228264'>⭐</tg-emoji> حداکثر مبلغ: <b>{MAX_AMOUNT:,} تومان</b>\n\n"
         "مثال: <code>50000</code>\n\n"
         "پس از ثبت مبلغ، اطلاعات پرداخت برای شما نمایش داده می‌شود."
     )
@@ -390,7 +363,7 @@ async def receive_wallet_amount(
 
     if amount is None:
         await message.answer(
-            "<tg-emoji emoji-id='5440681540541502133'>◉</tg-emoji> <b>مبلغ واردشده معتبر نیست.</b>\n\n"
+            "<tg-emoji emoji-id='5440681540541502133'>⭐</tg-emoji> <b>مبلغ واردشده معتبر نیست.</b>\n\n"
             f"لطفاً مبلغی بین {MIN_AMOUNT:,} تا "
             f"{MAX_AMOUNT:,} تومان وارد کنید.\n\n"
             "مثال: <code>50000</code>",
@@ -401,14 +374,14 @@ async def receive_wallet_amount(
     await state.set_state(WalletStates.waiting_receipt)
 
     text = (
-        "<tg-emoji emoji-id='5211047317309767043'>◉</tg-emoji> <b>اطلاعات پرداخت</b>\n\n"
+        "<tg-emoji emoji-id='5211047317309767043'>⭐</tg-emoji> <b>اطلاعات پرداخت</b>\n\n"
         "مرحله ۲ از ۳: <b>واریز مبلغ</b>\n\n"
-        f"<tg-emoji emoji-id='5445353829304387411'>◉</tg-emoji> مبلغ قابل پرداخت: <b>{amount:,} تومان</b>\n\n"
-        f"<tg-emoji emoji-id='5197288647275071607'>◉</tg-emoji> شماره کارت:\n<code>{html.escape(CARD_NUMBER)}</code>\n\n"
-        f"<tg-emoji emoji-id='5440389890787281213'>◉</tg-emoji> نام صاحب حساب: <b>{html.escape(CARD_HOLDER)}</b>\n\n"
+        f"<tg-emoji emoji-id='5445353829304387411'>⭐</tg-emoji> مبلغ قابل پرداخت: <b>{amount:,} تومان</b>\n\n"
+        f"<tg-emoji emoji-id='5197288647275071607'>⭐</tg-emoji> شماره کارت:\n<code>{html.escape(CARD_NUMBER)}</code>\n\n"
+        f"<tg-emoji emoji-id='5440389890787281213'>⭐</tg-emoji> نام صاحب حساب: <b>{html.escape(CARD_HOLDER)}</b>\n\n"
         "لطفاً مبلغ دقیق بالا را به شماره کارت اعلام‌شده واریز کنید.\n\n"
         "بعد از پرداخت، <b>عکس رسید بانکی</b> را همین‌جا ارسال کنید.\n\n"
-        "<tg-emoji emoji-id='5827691921073512783'>◉</tg-emoji> فقط عکس رسید پذیرفته می‌شود؛ فایل یا متن قابل قبول نیست."
+        "<tg-emoji emoji-id='5827691921073512783'>⭐</tg-emoji> فقط عکس رسید پذیرفته می‌شود؛ فایل یا متن قابل قبول نیست."
     )
 
     await message.answer(
@@ -435,7 +408,7 @@ async def receive_wallet_receipt(
 
     if photo.file_size and photo.file_size > MAX_RECEIPT_SIZE:
         await message.answer(
-            "<tg-emoji emoji-id='5440681540541502133'>◉</tg-emoji> حجم عکس رسید بیشتر از ۵ مگابایت است.\n"
+            "<tg-emoji emoji-id='5440681540541502133'>⭐</tg-emoji> حجم عکس رسید بیشتر از ۵ مگابایت است.\n"
             "لطفاً تصویر کم‌حجم‌تری ارسال کنید."
         )
         return
@@ -447,7 +420,7 @@ async def receive_wallet_receipt(
         await state.clear()
 
         await message.answer(
-            "<tg-emoji emoji-id='5440681540541502133'>◉</tg-emoji> اطلاعات درخواست شارژ پیدا نشد.\n"
+            "<tg-emoji emoji-id='5440681540541502133'>⭐</tg-emoji> اطلاعات درخواست شارژ پیدا نشد.\n"
             "لطفاً دوباره از بخش کیف پول شروع کنید."
         )
         return
@@ -463,7 +436,7 @@ async def receive_wallet_receipt(
         logger.exception("Could not create wallet payment request.")
 
         await message.answer(
-            "<tg-emoji emoji-id='5440681540541502133'>◉</tg-emoji> هنگام ثبت رسید مشکلی رخ داد.\n"
+            "<tg-emoji emoji-id='5440681540541502133'>⭐</tg-emoji> هنگام ثبت رسید مشکلی رخ داد.\n"
             "لطفاً چند دقیقه دیگر دوباره تلاش کنید."
         )
         return
@@ -472,7 +445,7 @@ async def receive_wallet_receipt(
         await state.clear()
 
         await message.answer(
-            "<tg-emoji emoji-id='5440739793182937488'>◉</tg-emoji>️ <b>درخواست قبلی شما هنوز در حال بررسی است.</b>\n\n"
+            "<tg-emoji emoji-id='5440739793182937488'>⭐</tg-emoji>️ <b>درخواست قبلی شما هنوز در حال بررسی است.</b>\n\n"
             "تا زمان تعیین وضعیت درخواست قبلی، امکان ثبت درخواست جدید وجود ندارد."
         )
         return
@@ -480,11 +453,11 @@ async def receive_wallet_receipt(
     await state.clear()
 
     await message.answer(
-        "<tg-emoji emoji-id='5440547189669516347'>◉</tg-emoji> <b>رسید شما با موفقیت دریافت شد.</b>\n\n"
-        f"<tg-emoji emoji-id='5445353829304387411'>◉</tg-emoji> مبلغ درخواست: <b>{amount:,} تومان</b>\n"
-        f"<tg-emoji emoji-id='5244609046459228264'>◉</tg-emoji> شماره درخواست: <code>{req_id}</code>\n\n"
-        "<tg-emoji emoji-id='5440389890787281213'>◉</tg-emoji> درخواست شما برای ادمین ارسال شد.\n\n"
-        "<tg-emoji emoji-id='5827691921073512783'>◉</tg-emoji> وضعیت درخواست: <b>در انتظار بررسی</b>\n\n"
+        "<tg-emoji emoji-id='5440547189669516347'>⭐</tg-emoji> <b>رسید شما با موفقیت دریافت شد.</b>\n\n"
+        f"<tg-emoji emoji-id='5445353829304387411'>⭐</tg-emoji> مبلغ درخواست: <b>{amount:,} تومان</b>\n"
+        f"<tg-emoji emoji-id='5244609046459228264'>⭐</tg-emoji> شماره درخواست: <code>{req_id}</code>\n\n"
+        "<tg-emoji emoji-id='5440389890787281213'>⭐</tg-emoji> درخواست شما برای ادمین ارسال شد.\n\n"
+        "<tg-emoji emoji-id='5827691921073512783'>⭐</tg-emoji> وضعیت درخواست: <b>در انتظار بررسی</b>\n\n"
         "پس از تأیید پرداخت، مبلغ به موجودی کیف پول شما اضافه خواهد شد."
     )
 
@@ -514,7 +487,7 @@ async def receive_wallet_receipt(
 @router.message(WalletStates.waiting_receipt)
 async def invalid_wallet_receipt(message: Message):
     await message.answer(
-        "<tg-emoji emoji-id='5440681540541502133'>◉</tg-emoji> <b>نوع فایل ارسالی صحیح نیست.</b>\n\n"
+        "<tg-emoji emoji-id='5440681540541502133'>⭐</tg-emoji> <b>نوع فایل ارسالی صحیح نیست.</b>\n\n"
         "لطفاً فقط عکس رسید بانکی را ارسال کنید.\n"
         "از ارسال متن، ویدیو یا فایل خودداری کنید."
     )
@@ -542,7 +515,7 @@ async def cancel_wallet_operation(
 
         await safe_edit_message(
             callback,
-            "<tg-emoji emoji-id='5440681540541502133'>◉</tg-emoji> <b>عملیات شارژ لغو شد.</b>\n\n" + text,
+            "<tg-emoji emoji-id='5440681540541502133'>⭐</tg-emoji> <b>عملیات شارژ لغو شد.</b>\n\n" + text,
             wallet_main_keyboard(),
         )
 
@@ -581,10 +554,10 @@ async def notify_admin_receipt(
     )
 
     caption = (
-        "<tg-emoji emoji-id='5264853679751600327'>◉</tg-emoji> <b>درخواست شارژ جدید</b>\n\n"
-        f"<tg-emoji emoji-id='5440389890787281213'>◉</tg-emoji> شناسه کاربر: <code>{user_id}</code>\n"
-        f"<tg-emoji emoji-id='5445353829304387411'>◉</tg-emoji> مبلغ: <b>{amount:,} تومان</b>\n"
-        f"<tg-emoji emoji-id='5244609046459228264'>◉</tg-emoji> شماره درخواست: <code>{req_id}</code>\n\n"
+        "<tg-emoji emoji-id='5264853679751600327'>⭐</tg-emoji> <b>درخواست شارژ جدید</b>\n\n"
+        f"<tg-emoji emoji-id='5440389890787281213'>⭐</tg-emoji> شناسه کاربر: <code>{user_id}</code>\n"
+        f"<tg-emoji emoji-id='5445353829304387411'>⭐</tg-emoji> مبلغ: <b>{amount:,} تومان</b>\n"
+        f"<tg-emoji emoji-id='5244609046459228264'>⭐</tg-emoji> شماره درخواست: <code>{req_id}</code>\n\n"
         "وضعیت: <b>در انتظار بررسی</b>"
     )
 
@@ -665,7 +638,7 @@ async def admin_approve_payment(
             try:
                 await callback.message.edit_caption(
                     caption=(
-                        "<tg-emoji emoji-id='5440547189669516347'>◉</tg-emoji> <b>پرداخت تأیید شد.</b>\n\n"
+                        "<tg-emoji emoji-id='5440547189669516347'>⭐</tg-emoji> <b>پرداخت تأیید شد.</b>\n\n"
                         f"شناسه درخواست: <code>{req_id}</code>\n"
                         f"مبلغ: <b>{req['amount']:,} تومان</b>"
                     ),
@@ -679,8 +652,8 @@ async def admin_approve_payment(
             await bot.send_message(
                 chat_id=req["telegram_id"],
                 text=(
-                    "<tg-emoji emoji-id='5440547189669516347'>◉</tg-emoji> <b>پرداخت شما تأیید شد.</b>\n\n"
-                    f"<tg-emoji emoji-id='5445353829304387411'>◉</tg-emoji> مبلغ افزوده‌شده: <b>{req['amount']:,} تومان</b>\n\n"
+                    "<tg-emoji emoji-id='5440547189669516347'>⭐</tg-emoji> <b>پرداخت شما تأیید شد.</b>\n\n"
+                    f"<tg-emoji emoji-id='5445353829304387411'>⭐</tg-emoji> مبلغ افزوده‌شده: <b>{req['amount']:,} تومان</b>\n\n"
                     "مبلغ با موفقیت به کیف پول شما اضافه شد."
                 ),
             )
@@ -769,7 +742,7 @@ async def admin_reject_payment(
             try:
                 await callback.message.edit_caption(
                     caption=(
-                        "<tg-emoji emoji-id='5440681540541502133'>◉</tg-emoji> <b>درخواست پرداخت رد شد.</b>\n\n"
+                        "<tg-emoji emoji-id='5440681540541502133'>⭐</tg-emoji> <b>درخواست پرداخت رد شد.</b>\n\n"
                         f"شناسه درخواست: <code>{req_id}</code>"
                     ),
                     reply_markup=None,
@@ -782,8 +755,8 @@ async def admin_reject_payment(
             await bot.send_message(
                 chat_id=req["telegram_id"],
                 text=(
-                    "<tg-emoji emoji-id='5440681540541502133'>◉</tg-emoji> <b>درخواست شارژ کیف پول شما رد شد.</b>\n\n"
-                    f"<tg-emoji emoji-id='5445353829304387411'>◉</tg-emoji> مبلغ درخواست: <b>{req['amount']:,} تومان</b>\n\n"
+                    "<tg-emoji emoji-id='5440681540541502133'>⭐</tg-emoji> <b>درخواست شارژ کیف پول شما رد شد.</b>\n\n"
+                    f"<tg-emoji emoji-id='5445353829304387411'>⭐</tg-emoji> مبلغ درخواست: <b>{req['amount']:,} تومان</b>\n\n"
                     "اگر فکر می‌کنید این تصمیم اشتباه است، "
                     "لطفاً با پشتیبانی تماس بگیرید."
                 ),
