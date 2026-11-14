@@ -23,6 +23,7 @@ from database import (
 )
 from rich import premium_emoji
 from utils import rate_limiter
+import ui
 
 logger = logging.getLogger(__name__)
 router = Router(name="referral")
@@ -160,48 +161,8 @@ async def _edit_or_send(
     text: str,
     keyboard: InlineKeyboardMarkup,
 ):
-    message = callback.message
-
-    if not isinstance(message, Message):
-        return
-
-    try:
-        await message.edit_text(
-            text=text,
-            reply_markup=keyboard,
-        )
-
-    except TelegramBadRequest as error:
-        if "message is not modified" in str(error).lower():
-            return
-
-        logger.warning(
-            "Referral message edit rejected: %s",
-            error,
-        )
-
-        try:
-            await message.answer(
-                text=text,
-                reply_markup=keyboard,
-            )
-        except Exception:
-            logger.exception(
-                "Could not send replacement referral message."
-            )
-
-    except Exception:
-        logger.exception("Referral message edit failed.")
-
-        try:
-            await message.answer(
-                text=text,
-                reply_markup=keyboard,
-            )
-        except Exception:
-            logger.exception(
-                "Could not send replacement referral message."
-            )
+    # از روی پیام اصلی (Rich) -> پیام جدید؛ از روی پیام Inline -> ویرایش.
+    await ui.show(callback, text, keyboard)
 
 
 def _valid_callback_user(callback: CallbackQuery) -> bool:
