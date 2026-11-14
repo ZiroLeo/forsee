@@ -21,6 +21,7 @@ from database import (
     record_user_activity,
     log_event,
 )
+import ui
 from utils import (
     rate_limiter,
     format_bytes,
@@ -63,9 +64,11 @@ EMOJI = {
 
 def tg_emoji(emoji_id: str, fallback: str = "●") -> str:
     """ساخت Premium Emoji برای متن HTML تلگرام."""
+    from rich import safe_emoji_text
+
     return (
         f'<tg-emoji emoji-id="{emoji_id}">'
-        f'{fallback}'
+        f'{safe_emoji_text("", fallback)}'
         f'</tg-emoji>'
     )
 
@@ -242,22 +245,27 @@ async def send_new_message(
     text: str,
     reply_markup: Optional[InlineKeyboardMarkup] = None,
 ):
-    """ارسال پیام جدید به جای ویرایش (با پشتیبانی از HTML و ایموجی پریمیوم)."""
-    message = callback.message
+    """
+    نمایش صفحه‌ی حساب در همان پیام (نام قدیمی حفظ شده).
 
-    if not isinstance(message, Message):
-        return
+    اگر کیبورد داده نشود، دکمه‌ی بازگشت گذاشته می‌شود تا کاربر
+    بعد از یک پیام خطا گیر نکند.
+    """
 
-    try:
-        await message.answer(
-            text=text,
-            reply_markup=reply_markup,
-            parse_mode="HTML",
+    if reply_markup is None:
+        reply_markup = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="بازگشت به منوی اصلی",
+                        callback_data="menu:main",
+                        style="danger",
+                    )
+                ]
+            ]
         )
-    except TelegramBadRequest as exc:
-        logger.warning("Could not send new account message: %s", exc)
-    except Exception:
-        logger.exception("Unexpected error while sending new account message.")
+
+    await ui.show(callback, text, reply_markup)
 
 
 def safe_log(event: str, user_id: int, detail: str = ""):
