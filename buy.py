@@ -23,6 +23,7 @@ from database import (
 from paxiva import PaxivaClient, PaxivaError
 from services.counter import make_config_name, release_reserved_number, reserve_new_config_number
 from rich import premium_emoji
+import ui
 from utils import (
     calculate_price_stars, calculate_price_toman, generate_idempotency_key,
     rate_limiter, validate_discount_code,
@@ -117,8 +118,7 @@ def _valid_config_uri(value: Any) -> bool:
     }
 
 
-# پیام اصلی Rich منو در state ذخیره نمی‌شود و هیچ‌وقت هدف edit نیست.
-# فقط message_id پیام جدید خرید در این state ذخیره و ویرایش می‌شود.
+# message_id همان پیامی که صفحه‌ی خرید در آن نمایش داده می‌شود در state ذخیره و ویرایش می‌شود.
 async def _edit_purchase(
     *, bot, state: FSMContext, text: str,
     reply_markup: Optional[InlineKeyboardMarkup] = None,
@@ -570,8 +570,10 @@ async def start_buy(callback: CallbackQuery, state: FSMContext):
 
     await state.clear()
     text = f"{premium_emoji('shop', '●')} <b>خرید سرویس آی‌من نتورک</b>\n\nنوع سرویس موردنظرت را انتخاب کن."
-    # ارسال پیام جدید؛ پیام Rich اصلی اصلاً ویرایش نمی‌شود.
-    purchase_message = await callback.message.answer(text, reply_markup=buy_type_selection_keyboard())
+    # همان پیام اصلی به صفحه‌ی خرید ویرایش می‌شود (شناسه‌اش در state ثبت می‌شود).
+    purchase_message = await ui.show(callback, text, buy_type_selection_keyboard())
+    if purchase_message is None:
+        return
     await state.update_data(
         user_id=user.id, purchase_chat_id=purchase_message.chat.id,
         purchase_message_id=purchase_message.message_id,
