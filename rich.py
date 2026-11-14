@@ -6,7 +6,9 @@ from aiogram import Bot
 from aiogram.types import InputRichMessage
 from aiogram.types.rich_message_button import RichMessageButton
 from aiogram.types.input_rich_block_buttons import InputRichBlockButtons
+from aiogram.types.input_rich_block_paragraph import InputRichBlockParagraph
 from aiogram.types.rich_text_custom_emoji import RichTextCustomEmoji
+from aiogram.types.rich_text_bold import RichTextBold
 
 from config import PREMIUM_EMOJIS, PREMIUM_EMOJI_ENABLED
 
@@ -123,6 +125,50 @@ async def initialize_premium_emojis(bot: Bot) -> int:
 
 
 # ============================================================
+# SAFE EMOJI TEXT
+# ============================================================
+
+SAFE_EMOJI_DEFAULT = "⭐"
+
+
+def is_valid_emoji_text(value: str) -> bool:
+    """
+    متن داخل <tg-emoji> باید ایموجی واقعی باشد.
+    کاراکترهایی مثل ● ◉ ◈ • باعث خطای ENTITY_TEXT_INVALID می‌شوند.
+    """
+
+    if not value or not value.strip():
+        return False
+
+    for char in value:
+        code = ord(char)
+
+        if code < 0x2100 or 0x25A0 <= code <= 0x25FF:
+            return False
+
+    return True
+
+
+def safe_emoji_text(key: str = "", fallback: str = "") -> str:
+    """
+    بهترین متن معتبر برای داخل تگ ایموجی پریمیوم:
+    ۱) ایموجی خود استیکر (از کش تلگرام)
+    ۲) fallback اگر ایموجی واقعی باشد
+    ۳) ⭐
+    """
+
+    cached = _PREMIUM_EMOJI_CACHE.get(key) if key else None
+
+    if cached and is_valid_emoji_text(cached[1]):
+        return cached[1]
+
+    if is_valid_emoji_text(fallback):
+        return fallback
+
+    return SAFE_EMOJI_DEFAULT
+
+
+# ============================================================
 # PREMIUM EMOJI FOR MESSAGE TEXT
 # ============================================================
 
@@ -154,7 +200,7 @@ def premium_emoji(
     if not emoji_id:
         return _escape_html(fallback)
 
-    safe_fallback = _escape_html(fallback)
+    safe_fallback = _escape_html(safe_emoji_text(key, fallback))
 
     return (
         f'<tg-emoji emoji-id="{emoji_id}">'
@@ -251,7 +297,7 @@ def build_button(
 
 def build_button_row(
     buttons: List[RichMessageButton],
-    align: str = "left",
+    align: str = "center",
 ) -> InputRichBlockButtons:
 
     if not isinstance(buttons, list):
@@ -279,28 +325,68 @@ def build_button_row(
 # RICH MESSAGE
 # ============================================================
 
+def rich_emoji(
+    key: str,
+    fallback: str = "●",
+) -> Any:
+    """
+    ایموجی پریمیوم برای متن Rich Message (به‌صورت RichText).
+
+    اگر ایموجی در دسترس نباشد، ایموجی معمولی (fallback) برگردانده می‌شود.
+    """
+
+    if not PREMIUM_EMOJI_ENABLED or not isinstance(PREMIUM_EMOJIS, dict):
+        return fallback
+
+    emoji_id = str(PREMIUM_EMOJIS.get(key) or "").strip()
+
+    if not emoji_id:
+        return fallback
+
+    alternative_text = safe_emoji_text(key, fallback)
+
+    return RichTextCustomEmoji(
+        custom_emoji_id=emoji_id,
+        alternative_text=alternative_text,
+    )
+
+
+def rich_bold(*parts: Any) -> RichTextBold:
+    """متن بولد برای Rich Message."""
+    return RichTextBold(text=list(parts))
+
+
 def build_rich_message(
-    html_text: str,
+    paragraphs: List[Any],
     button_rows: Optional[List[InputRichBlockButtons]] = None,
+    rtl: bool = True,
 ) -> InputRichMessage:
     """
-    ساخت پیام Rich.
+    ساخت پیام Rich فقط با blocks.
 
-    اگر دکمه وجود داشته باشد blocks ارسال می‌شود.
-    اگر دکمه وجود نداشته باشد blocks ارسال نمی‌شود.
+    تلگرام اجازه می‌دهد دقیقاً یکی از html / markdown / blocks
+    استفاده شود. ارسال هم‌زمان html و blocks باعث می‌شد متن اول
+    نمایش داده نشود؛ بنابراین متن هم به‌صورت بلوک پاراگراف ساخته
+    می‌شود و دکمه‌ها بعد از آن می‌آیند.
+
+    paragraphs: لیستی از متن‌ها. هر عضو یک پاراگراف است و می‌تواند
+                str یا لیستی از str / rich_emoji() / rich_bold() باشد.
     """
 
-    if not isinstance(html_text, str):
+    if not isinstance(paragraphs, list) or not paragraphs:
         raise TypeError(
-            "html_text must be a string."
+            "paragraphs must be a non-empty list."
         )
+
+    blocks: list = [
+        InputRichBlockParagraph(text=paragraph)
+        for paragraph in paragraphs
+    ]
 
     if button_rows:
-        return InputRichMessage(
-            html=html_text,
-            blocks=button_rows,
-        )
+        blocks.extend(button_rows)
 
     return InputRichMessage(
-        html=html_text,
+        blocks=blocks,
+        is_rtl=rtl,
     )
