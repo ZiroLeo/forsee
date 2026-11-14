@@ -30,6 +30,7 @@ from database import (
 from paxiva import PaxivaClient, PaxivaError
 
 from rich import premium_emoji
+import ui
 
 from utils import (
     rate_limiter,
@@ -430,9 +431,11 @@ async def _render_renew_list(callback: CallbackQuery) -> None:
     subscriptions = subscriptions[:MAX_RENEW_LIST]
 
     try:
-        await callback.message.edit_text(
-            text=_renew_list_text(),
-            reply_markup=renew_list_keyboard(subscriptions),
+        # از روی پیام اصلی (Rich) -> پیام جدید؛ از روی پیام Inline -> ویرایش
+        await ui.show(
+            callback,
+            _renew_list_text(),
+            renew_list_keyboard(subscriptions),
         )
 
     except Exception as exc:
