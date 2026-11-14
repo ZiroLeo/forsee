@@ -1,6 +1,5 @@
 import logging
 import re
-import html
 
 from aiogram import Router, F
 from aiogram.filters import CommandStart, CommandObject
@@ -16,9 +15,10 @@ from database import (
     log_event,
 )
 
-from rich import premium_emoji, build_rich_message
+from rich import rich_emoji, rich_bold, build_rich_message
 from keyboards import main_menu_rich_message
 from utils import rate_limiter
+import ui
 
 
 logger = logging.getLogger(__name__)
@@ -58,22 +58,26 @@ def extract_referrer_id(payload: str, user_id: int):
 
 def create_main_menu_message(first_name: str = None):
     """
-    ساخت پیام خوش‌آمدگویی با نام کاربر و ایموجی‌های پریمیوم.
-    """
-    safe_name = html.escape((first_name or "دوست عزیز").strip())
+    ساخت پیام اصلی (Rich): ابتدا متن خوش‌آمدگویی، سپس دکمه‌ها.
 
-    welcome_text = (
-        f"{premium_emoji('gram', '👋')} "
-        f"<b>{safe_name}</b> "
-        "به آی‌من نتورک خوش اومدی! "
-        f"{premium_emoji('shop', '🛒')}"
-        "\n\n"
-        "از منوی زیر می‌تونی خدمات موردنظرت رو انتخاب کنی:"
-    )
+    متن به‌صورت بلوک پاراگراف ساخته می‌شود (نه html) تا همراه
+    دکمه‌ها (blocks) درست نمایش داده شود. نیازی به escape نیست.
+    """
+    name = (first_name or "دوست عزیز").strip() or "دوست عزیز"
+
+    title = [
+        rich_emoji("gram", "👋"),
+        " ",
+        rich_bold(name),
+        " به آی‌من نتورک خوش اومدی! ",
+        rich_emoji("shop", "🛒"),
+    ]
+
+    body = "از منوی زیر می‌تونی خدمات موردنظرت رو انتخاب کنی:"
 
     return build_rich_message(
-        html_text=welcome_text,
-        button_rows=main_menu_rich_message()
+        [title, body],
+        main_menu_rich_message(),
     )
 
 
@@ -289,10 +293,8 @@ async def callback_main_menu(callback: CallbackQuery):
             user.first_name
         )
 
-        # ارسال پیام جدید؛ پیام قبلی ویرایش نمی‌شود.
-        await callback.message.answer_rich(
-            rich_message=rich_message
-        )
+        # همان پیام (مثلاً صفحه‌ی پشتیبانی) به منوی اصلی ویرایش می‌شود.
+        await ui.show_main_menu(callback, rich_message)
 
         await callback.answer()
 
