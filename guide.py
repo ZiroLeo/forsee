@@ -3,16 +3,17 @@ import logging
 from urllib.parse import urlparse
 
 from aiogram import Router, F
-from aiogram.types import CallbackQuery
-
-from database import get_setting, record_user_activity
-from rich import (
-    build_rich_message,
-    premium_emoji,
-    build_button_row,
-    build_button,
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
 )
+
+from config import PREMIUM_EMOJIS
+from database import get_setting, record_user_activity
+from rich import premium_emoji
 from utils import rate_limiter
+import ui
 
 logger = logging.getLogger(__name__)
 router = Router(name="guide")
@@ -23,6 +24,15 @@ router = Router(name="guide")
 # ============================================================
 
 DEFAULT_GUIDE_URL = "https://t.me/YourChannel"
+
+
+def _back_button() -> InlineKeyboardButton:
+    return InlineKeyboardButton(
+        text="بازگشت به منوی اصلی",
+        callback_data="menu:main",
+        style="danger",
+        icon_custom_emoji_id=PREMIUM_EMOJIS.get("back"),
+    )
 
 
 def _get_valid_guide_url() -> str | None:
@@ -93,16 +103,11 @@ async def show_guide(callback: CallbackQuery):
                 "لطفاً بعداً دوباره تلاش کنید."
             )
 
-            buttons = [
-                build_button_row([
-                    build_button(
-                        "بازگشت به منوی اصلی",
-                        callback_data="menu:main",
-                        style="danger",
-                        premium_emoji_key="back",
-                    ),
-                ])
-            ]
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [_back_button()],
+                ]
+            )
 
         else:
             text = (
@@ -120,33 +125,22 @@ async def show_guide(callback: CallbackQuery):
                 "۴. اتصال به سرویس"
             )
 
-            buttons = [
-                build_button_row([
-                    build_button(
-                        "مشاهده آموزش",
-                        url=guide_url,
-                        style="primary",
-                        premium_emoji_key="quest",
-                    ),
-                ]),
-                build_button_row([
-                    build_button(
-                        "بازگشت به منوی اصلی",
-                        callback_data="menu:main",
-                        style="danger",
-                        premium_emoji_key="back",
-                    ),
-                ]),
-            ]
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="مشاهده آموزش",
+                            url=guide_url,
+                            style="primary",
+                            icon_custom_emoji_id=PREMIUM_EMOJIS.get("quest"),
+                        ),
+                    ],
+                    [_back_button()],
+                ]
+            )
 
-        rich = build_rich_message(
-            text,
-            buttons,
-        )
-
-        await callback.message.edit_text(
-            rich_message=rich,
-        )
+        # پیام جدید با Inline Keyboard؛ پیام اصلی (Rich) ادیت نمی‌شود.
+        await ui.show(callback, text, keyboard)
 
         await callback.answer()
 
