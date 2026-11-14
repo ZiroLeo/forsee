@@ -31,6 +31,8 @@ from database import (
 from paxiva import PaxivaClient, PaxivaError
 from utils import rate_limiter, generate_idempotency_key
 from config import PREMIUM_EMOJIS, PREMIUM_EMOJI_ENABLED
+from rich import premium_emoji
+import ui
 
 
 logger = logging.getLogger(__name__)
@@ -149,49 +151,17 @@ async def safe_edit(
     text: str,
     keyboard: InlineKeyboardMarkup | None = None,
 ) -> bool:
-    """ویرایش امن پیام و ارسال پیام جایگزین در صورت شکست."""
+    """
+    نمایش صفحه‌ی گردونه.
 
-    message = callback.message
+    کلیک از روی پیام اصلی (Rich) -> پیام جدید (پیام اصلی ادیت نمی‌شود).
+    کلیک از روی پیام جدید گردونه  -> همان پیام ویرایش می‌شود
+    (مثلاً «در حال ثبت جایزه» و بعد نتیجه).
+    """
 
-    if not isinstance(message, Message):
-        return False
+    shown = await ui.show(callback, text, keyboard)
 
-    try:
-        await message.edit_text(
-            text=text,
-            reply_markup=keyboard,
-        )
-        return True
-
-    except TelegramBadRequest as error:
-
-        error_text = str(error).lower()
-
-        if "message is not modified" in error_text:
-            return True
-
-        logger.warning(
-            "Could not edit wheel message: %s",
-            error,
-        )
-
-    except Exception:
-        logger.exception(
-            "Unexpected error while editing wheel message."
-        )
-
-    try:
-        await message.answer(
-            text=text,
-            reply_markup=keyboard,
-        )
-        return True
-
-    except Exception:
-        logger.exception(
-            "Could not send replacement wheel message."
-        )
-        return False
+    return shown is not None
 
 
 def safe_log(
@@ -352,22 +322,24 @@ def get_wheel_page_text(
 ) -> str:
     """متن صفحه اصلی گردونه."""
 
+    dot = premium_emoji("blue_dot", "•")
+
     if can_spin:
         return (
-            "<b>گردونه شانس آی‌من نتورک</b>\n\n"
-            "<b>جوایز گردونه:</b>\n\n"
-            "• ۵۰٪ احتمال پوچ\n"
-            "• ۲۰٪ احتمال دریافت ۲,۰۰۰ تومان\n"
-            "• ۲۰٪ احتمال دریافت کانفیگ ۱ گیگ\n"
-            "• ۱۰٪ احتمال دریافت کانفیگ ۲ گیگ\n\n"
+            f"{premium_emoji('dice', '🎲')} <b>گردونه شانس آی‌من نتورک</b>\n\n"
+            f"{premium_emoji('gift', '🎁')} <b>جوایز گردونه:</b>\n\n"
+            f"{dot} ۵۰٪ احتمال پوچ\n"
+            f"{dot} ۲۰٪ احتمال دریافت ۲,۰۰۰ تومان\n"
+            f"{dot} ۲۰٪ احتمال دریافت کانفیگ ۱ گیگ\n"
+            f"{dot} ۱۰٪ احتمال دریافت کانفیگ ۲ گیگ\n\n"
             "هر کاربر هر ۲۴ ساعت یک بار می‌تواند گردونه را بچرخاند.\n\n"
-            "<b>آماده‌ای شانست رو امتحان کنی؟</b>"
+            f"{premium_emoji('stars', '⭐')} <b>آماده‌ای شانست رو امتحان کنی؟</b>"
         )
 
     return (
-        "<b>گردونه شانس</b>\n\n"
+        f"{premium_emoji('dice', '🎲')} <b>گردونه شانس</b>\n\n"
         "شما در ۲۴ ساعت گذشته از گردونه استفاده کرده‌اید.\n\n"
-        "<b>زمان باقی‌مانده تا چرخش بعدی:</b>\n"
+        f"{premium_emoji('light', '💡')} <b>زمان باقی‌مانده تا چرخش بعدی:</b>\n"
         f"<b>{html.escape(remaining)}</b>\n\n"
         "بعد از پایان این زمان می‌توانید دوباره شانس خود را امتحان کنید."
     )
@@ -427,7 +399,7 @@ async def show_wheel(callback: CallbackQuery):
 
         if isinstance(callback.message, Message):
             await callback.message.answer(
-                "<b>در حال حاضر امکان نمایش گردونه وجود ندارد.</b>\n"
+                f"{premium_emoji('warning', '⚠️')} <b>در حال حاضر امکان نمایش گردونه وجود ندارد.</b>\n"
                 "لطفاً کمی بعد دوباره تلاش کنید."
             )
 
@@ -480,7 +452,7 @@ async def spin_wheel(
             await safe_edit(
                 callback,
                 (
-                    "<b>هنوز زمان چرخش بعدی نرسیده است.</b>\n\n"
+                    f"{premium_emoji('light', '💡')} <b>هنوز زمان چرخش بعدی نرسیده است.</b>\n\n"
                     f"زمان باقی‌مانده: <b>{html.escape(remaining)}</b>"
                 ),
                 wheel_keyboard(False),
@@ -525,7 +497,7 @@ async def spin_wheel(
             await safe_edit(
                 callback,
                 (
-                    "<b>ثبت چرخش انجام نشد.</b>\n\n"
+                    f"{premium_emoji('false', '❌')} <b>ثبت چرخش انجام نشد.</b>\n\n"
                     "لطفاً دوباره وارد گردونه شوید."
                 ),
                 wheel_result_keyboard(),
@@ -536,7 +508,7 @@ async def spin_wheel(
         await safe_edit(
             callback,
             (
-                "<b>گردونه چرخید!</b>\n\n"
+                f"{premium_emoji('dice', '🎲')} <b>گردونه چرخید!</b>\n\n"
                 "در حال ثبت جایزه شما هستیم...\n"
                 "لطفاً تا پایان عملیات صبر کنید."
             ),
@@ -550,7 +522,7 @@ async def spin_wheel(
         if prize_type == "nothing":
 
             text = (
-                "<b>نتیجه گردونه</b>\n\n"
+                f"{premium_emoji('dice', '🎲')} <b>نتیجه گردونه</b>\n\n"
                 "متأسفانه این بار جایزه‌ای برنده نشدید!\n\n"
                 "شانس خود را ۲۴ ساعت دیگر امتحان کنید."
             )
@@ -593,7 +565,7 @@ async def spin_wheel(
                 await safe_edit(
                     callback,
                     (
-                        "<b>خطا در واریز جایزه</b>\n\n"
+                        f"{premium_emoji('warning', '⚠️')} <b>خطا در واریز جایزه</b>\n\n"
                         "گردونه شما ثبت شده، اما واریز جایزه انجام نشد.\n"
                         "لطفاً با پشتیبانی تماس بگیرید."
                     ),
@@ -617,9 +589,9 @@ async def spin_wheel(
             )
 
             text = (
-                "<b>تبریک! برنده شدی!</b>\n\n"
+                f"{premium_emoji('gift', '🎁')} <b>تبریک! برنده شدی!</b>\n\n"
                 f"جایزه شما: <b>{html.escape(prize_text)}</b>\n\n"
-                "<b>موجودی جدید کیف پول:</b>\n"
+                f"{premium_emoji('wallet', '👛')} <b>موجودی جدید کیف پول:</b>\n"
                 f"<b>{new_balance:,} تومان</b>\n\n"
                 "امیدواریم دفعه بعد هم برنده شوید!"
             )
@@ -710,7 +682,7 @@ async def spin_wheel(
                     )
 
                 text = (
-                    "<b>تبریک! برنده کانفیگ رایگان شدی!</b>\n\n"
+                    f"{premium_emoji('gift', '🎁')} <b>تبریک! برنده کانفیگ رایگان شدی!</b>\n\n"
                     f"جایزه: <b>{html.escape(prize_text)}</b>\n\n"
                     f"نام کانفیگ: <code>{html.escape(config_name)}</code>\n"
                     f"حجم: <b>{prize_gb} گیگابایت</b>\n"
@@ -720,7 +692,7 @@ async def spin_wheel(
 
                 if link:
                     text += (
-                        "<b>لینک اتصال:</b>\n"
+                        f"{premium_emoji('safe', '🔐')} <b>لینک اتصال:</b>\n"
                         f"<code>{html.escape(str(link))}</code>\n\n"
                     )
                 else:
@@ -769,7 +741,7 @@ async def spin_wheel(
                 await safe_edit(
                     callback,
                     (
-                        "<b>ساخت کانفیگ با مشکل مواجه شد.</b>\n\n"
+                        f"{premium_emoji('warning', '⚠️')} <b>ساخت کانفیگ با مشکل مواجه شد.</b>\n\n"
                         "چرخش شما ثبت شده، اما ساخت جایزه کامل نشد.\n"
                         "لطفاً با پشتیبانی تماس بگیرید."
                     ),
@@ -803,7 +775,7 @@ async def spin_wheel(
                 await safe_edit(
                     callback,
                     (
-                        "<b>خطای غیرمنتظره رخ داد.</b>\n\n"
+                        f"{premium_emoji('warning', '⚠️')} <b>خطای غیرمنتظره رخ داد.</b>\n\n"
                         "چرخش شما ثبت شده، اما ساخت کانفیگ با مشکل مواجه شد.\n"
                         "لطفاً با پشتیبانی تماس بگیرید."
                     ),
@@ -829,7 +801,7 @@ async def spin_wheel(
         await safe_edit(
             callback,
             (
-                "<b>خطایی هنگام چرخاندن گردونه رخ داد.</b>\n\n"
+                f"{premium_emoji('warning', '⚠️')} <b>خطایی هنگام چرخاندن گردونه رخ داد.</b>\n\n"
                 "لطفاً کمی بعد دوباره تلاش کنید.\n"
                 "اگر از حساب شما یک چرخش کم شده، با پشتیبانی تماس بگیرید."
             ),
