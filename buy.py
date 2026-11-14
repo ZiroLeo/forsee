@@ -432,46 +432,24 @@ async def _edit_or_answer(
     text: str,
     reply_markup=None,
 ) -> None:
+    """
+    همیشه یک پیام جدید ارسال می‌کند.
+    پیام قبلی تحت هیچ شرایطی ویرایش یا حذف نمی‌شود.
+    """
 
     if not message:
         return
 
     try:
-        await message.edit_text(
+        await message.answer(
             text,
             reply_markup=reply_markup,
         )
 
-    except TelegramBadRequest as exc:
-
-        if "message is not modified" in str(exc).lower():
-            return
-
-        try:
-            await message.answer(
-                text,
-                reply_markup=reply_markup,
-            )
-        except Exception:
-            logger.exception(
-                "Could not send fallback message."
-            )
-
     except Exception:
-
         logger.exception(
-            "Could not edit purchase message."
+            "Could not send new purchase message."
         )
-
-        try:
-            await message.answer(
-                text,
-                reply_markup=reply_markup,
-            )
-        except Exception:
-            logger.exception(
-                "Could not send fallback message."
-            )
 
 
 def _safe_text(value: Any) -> str:
@@ -630,9 +608,6 @@ def _calculate_prices(
         )
 
         return toman, stars
-
-    # حجمی و نامحدود منصفانه ۱۵۰ گیگ
-    # طبق مدل قیمت‌گذاری فعلی، قیمت بر اساس حجم محاسبه می‌شود.
 
     return (
         calculate_price_toman(
@@ -932,13 +907,6 @@ async def _provision_purchase(
     payment_type: str,
 ) -> tuple[str, str]:
 
-    """
-    خروجی:
-        success  -> خرید موفق
-        failed   -> شکست قطعی و جبران‌شده
-        pending  -> وضعیت مبهم؛ نیازمند بررسی و عدم تکرار خرید
-    """
-
     if payment_type != "wallet":
         return (
             "failed",
@@ -1037,7 +1005,6 @@ async def _provision_purchase(
             f"buy-{user_id}-{number}"
         )
 
-        # از این لحظه ممکن است درخواست به پنل رسیده باشد.
         create_request_started = True
 
         client_data = await paxiva.create_client(
@@ -1172,9 +1139,6 @@ async def _provision_purchase(
                 ),
             )
 
-            # شماره و مبلغ را نگه می‌داریم.
-            # آزاد کردن آن‌ها ممکن است باعث ساخت کانفیگ تکراری شود.
-
             return (
                 "pending",
                 (
@@ -1209,7 +1173,6 @@ async def _provision_purchase(
                     ),
                 )
 
-                # سرویس ممکن است فعال باشد؛ وجه را خودکار برنمی‌گردانیم.
                 return (
                     "pending",
                     (
@@ -1501,7 +1464,6 @@ async def select_volume(
 
     volume_key = callback.data.rsplit(":", 1)[-1]
 
-    # اعتبارسنجی نوع سرویس در سمت سرور
     if service_type == SERVICE_VOLUME:
 
         if volume_key not in VOLUME_OPTIONS:
@@ -1544,7 +1506,6 @@ async def select_volume(
         discount_percent=0,
     )
 
-    # نامحدود بی‌نهایت: بدون انتخاب مدت
     if volume_key == "unl_inf":
 
         await state.update_data(
@@ -1558,7 +1519,6 @@ async def select_volume(
         )
         return
 
-    # سایر سرویس‌ها: انتخاب مدت
     months = 1
 
     await state.update_data(
@@ -2073,7 +2033,6 @@ async def pay_with_wallet(
 
         data = await state.get_data()
 
-        # سفارش مبهم نباید دوباره اجرا شود.
         if data.get("purchase_pending"):
 
             await _edit_or_answer(
@@ -2096,7 +2055,6 @@ async def pay_with_wallet(
             await state.clear()
             return
 
-        # قیمت را مجدداً سمت سرور محاسبه می‌کنیم.
         try:
 
             price, _, _, _ = _build_order_prices(data)
@@ -2113,7 +2071,6 @@ async def pay_with_wallet(
             )
             return
 
-        # بررسی موجودی فقط برای نمایش؛ کسر واقعی اتمیک است.
         try:
             balance = get_balance(user.id)
         except Exception:
