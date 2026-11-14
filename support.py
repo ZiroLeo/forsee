@@ -11,6 +11,7 @@ from config import PREMIUM_EMOJIS, PREMIUM_EMOJI_ENABLED
 from database import get_setting, record_user_activity
 from rich import premium_emoji
 from utils import rate_limiter
+import ui
 
 logger = logging.getLogger(__name__)
 router = Router(name="support")
@@ -71,9 +72,11 @@ async def show_support(callback: CallbackQuery):
     )
 
     try:
-        await callback.message.edit_text(
-            text=text,
-            reply_markup=support_keyboard(support_url),
+        # همان پیام اصلی به صفحه‌ی پشتیبانی ویرایش می‌شود.
+        await ui.show(
+            callback,
+            text,
+            support_keyboard(support_url),
         )
 
     except Exception:
