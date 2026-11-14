@@ -4,6 +4,7 @@ from typing import Any, Dict, Optional
 
 from aiogram import Router, F
 from aiogram.types import CallbackQuery
+import ui
 
 from database import (
     get_user,
@@ -15,7 +16,7 @@ from database import (
     get_connection,
 )
 from paxiva import PaxivaClient, PaxivaError
-from rich import build_rich_message, premium_emoji
+from rich import premium_emoji
 from keyboards import test_account_keyboard
 from utils import rate_limiter, generate_idempotency_key
 
@@ -163,13 +164,12 @@ async def show_test_account(callback: CallbackQuery):
             return
 
         already_used = int(db_user.get("trial_used") or 0) == 1
-        rich = build_rich_message(
+        # پیام جدید با Inline Keyboard؛ پیام اصلی (Rich) ادیت نمی‌شود.
+        await ui.show(
+            callback,
             _page_text(already_used),
             test_account_keyboard(already_used=already_used),
         )
-
-        if callback.message:
-            await callback.message.edit_text(rich_message=rich)
 
     except Exception:
         logger.exception("Failed to show test account page for user %s", user.id)
@@ -303,7 +303,8 @@ async def get_test_account(callback: CallbackQuery, paxiva: PaxivaClient):
 
         if callback.message:
             await callback.message.edit_text(
-                rich_message=build_rich_message(success_text)
+                success_text,
+                reply_markup=test_account_keyboard(already_used=True),
             )
 
         log_event(
