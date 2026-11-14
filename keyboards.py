@@ -7,6 +7,7 @@ from aiogram.types import (
 )
 from aiogram.types.input_rich_block_buttons import InputRichBlockButtons
 
+from config import PREMIUM_EMOJIS, PREMIUM_EMOJI_ENABLED
 from rich import build_button, build_button_row
 
 
@@ -61,6 +62,50 @@ def _get_button_style(text: str) -> str:
     return STYLE_PRIMARY
 
 
+# آیکن پریمیوم دکمه‌ها بر اساس callback_data (به ترتیب اولویت)
+_ICON_BY_CALLBACK = (
+    ("menu:main", "back"),
+    ("wheel:spin", "dice"),
+    ("test:get", "flower_gift"),
+    ("menu:wheel", "dice"),
+    ("menu:wallet", "wallet"),
+    ("wallet:", "wallet"),
+    ("menu:referral", "referral"),
+    ("referral:", "referral"),
+    ("menu:account", "telegram"),
+    ("account:", "telegram"),
+    ("menu:support", "ask"),
+    ("menu:renew", "world"),
+    ("renew:", "world"),
+    ("menu:buy", "shop"),
+    ("buy:", "shop"),
+)
+
+
+def _icon_id_for(text: str, callback_data: str) -> Optional[str]:
+    """شناسه ایموجی پریمیوم دکمه، یا None اگر در دسترس نباشد."""
+
+    if not PREMIUM_EMOJI_ENABLED or not isinstance(PREMIUM_EMOJIS, dict):
+        return None
+
+    key = None
+
+    if "بازگشت" in str(text):
+        key = "back"
+    else:
+        for prefix, emoji_key in _ICON_BY_CALLBACK:
+            if callback_data.startswith(prefix):
+                key = emoji_key
+                break
+
+    if not key:
+        return None
+
+    emoji_id = str(PREMIUM_EMOJIS.get(key) or "").strip()
+
+    return emoji_id or None
+
+
 def _inline_keyboard(
     rows: List[List[InlineKeyboardButton]],
 ) -> InlineKeyboardMarkup:
@@ -106,6 +151,7 @@ def _button(
         text=text,
         callback_data=callback_data,
         style=selected_style,
+        icon_custom_emoji_id=_icon_id_for(text, callback_data),
     )
 
 
@@ -174,6 +220,9 @@ def main_menu_rich_message() -> List[InputRichBlockButtons]:
             style="success",
             premium_emoji_key="referral",
         ),
+    ])
+
+    row5 = build_button_row([
         build_button(
             "پشتیبانی",
             callback_data="menu:support",
@@ -187,6 +236,7 @@ def main_menu_rich_message() -> List[InputRichBlockButtons]:
         row2,
         row3,
         row4,
+        row5,
     ]
 
 
