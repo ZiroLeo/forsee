@@ -1,7 +1,6 @@
-
 import logging
 import re
-from html import escape
+import html
 
 from aiogram import Router, F
 from aiogram.filters import CommandStart, CommandObject
@@ -27,7 +26,7 @@ router = Router(name="start")
 
 
 # ============================================================
-# REFERRAL VALIDATION
+# Referral Validation
 # ============================================================
 
 REFERRAL_PATTERN = re.compile(r"^REF_(\d{5,15})$")
@@ -54,21 +53,20 @@ def extract_referrer_id(payload: str, user_id: int):
 
 
 # ============================================================
-# MAIN MENU
+# Main Rich Menu
 # ============================================================
 
 def create_main_menu_message(first_name: str = None):
-    """ساخت پیام خوشامدگویی و منوی اصلی Rich."""
-
-    safe_name = escape(
-        (first_name or "دوست عزیز").strip()
-    )
+    """
+    ساخت پیام خوش‌آمدگویی با نام کاربر و ایموجی‌های پریمیوم.
+    """
+    safe_name = html.escape((first_name or "دوست عزیز").strip())
 
     welcome_text = (
-        f"{premium_emoji('gram', '●')} "
+        f"{premium_emoji('gram', '👋')} "
         f"<b>{safe_name}</b> "
         "به آی‌من نتورک خوش اومدی! "
-        f"{premium_emoji('shop', '●')}"
+        f"{premium_emoji('shop', '🛒')}"
         "\n\n"
         "از منوی زیر می‌تونی خدمات موردنظرت رو انتخاب کنی:"
     )
@@ -80,14 +78,12 @@ def create_main_menu_message(first_name: str = None):
 
 
 async def send_main_menu(message: Message):
-    """ارسال منوی اصلی به‌صورت پیام جدید."""
-
-    user = message.from_user
+    """ارسال منوی اصلی به‌صورت Rich Message با نام کاربر."""
 
     first_name = (
-        user.first_name
-        if user and user.first_name
-        else None
+        message.from_user.first_name
+        if message.from_user
+        else "دوست عزیز"
     )
 
     rich_message = create_main_menu_message(first_name)
@@ -98,7 +94,7 @@ async def send_main_menu(message: Message):
 
 
 # ============================================================
-# USER REGISTRATION
+# User Registration
 # ============================================================
 
 def register_user(message: Message):
@@ -117,12 +113,13 @@ def register_user(message: Message):
 
 
 # ============================================================
-# COMMON START PROCESS
+# /start With Referral
 # ============================================================
 
-async def process_start(
+@router.message(CommandStart(deep_link=True))
+async def cmd_start_with_referral(
     message: Message,
-    referral_payload: str = None
+    command: CommandObject
 ):
     user = message.from_user
 
@@ -132,81 +129,122 @@ async def process_start(
     # بررسی مسدود بودن کاربر
     if is_banned(user.id):
         await message.answer(
-            f"{premium_emoji('warning', '!')} "
-            "<b>دسترسی شما به ربات مسدود شده است.</b>"
+            "⛔ شما از استفاده از ربات محروم شده‌اید."
+        )
+        return
+
+    # محدودیت تعداد درخواست
+    if not rate_limiter.is_allowed(user.id):
+        await message.answer(
+            "⏳ لطفاً کمی صبر کنید و دوباره تلاش کنید."
+        )
+        return
+
+    # استخراج کد رفرال
+    referrer_id = extract_referrer_id(
+        command.args,
+        user.id
+    )
+
+    try:
+        # ثبت یا به‌روزرسانی کاربر
+        is_new = register_user(message)
+
+        # فقط کاربر جدید می‌تواند معرف بگیرد
+        if is_new and referrer_id:
+            # بررسی وجود معرف
+            referrer = get_user(referrer_id)
+
+            if referrer:
+                registered = set_referral(
+                    referrer_id,
+                    user.id,
+                )
+
+                if registered:
+                    logger.info(
+                        "Referral registered: %s -> %s",
+                        referrer_id,
+                        user.id,
+                    )
+
+                    log_event(
+                        "INFO",
+                        "referral_registered",
+                        user.id,
+                        f"Direct referrer: {referrer_id}",
+                    )
+            else:
+                logger.warning(
+                    "Referral ignored: referrer %s does not exist.",
+                    referrer_id,
+                )
+
+        # ثبت فعالیت کاربر
+        record_user_activity(user.id)
+
+        # ارسال منوی اصلی Rich
+        await send_main_menu(message)
+
+        logger.info(
+            "Main menu sent to user %s",
+            user.id,
+        )
+
+    except Exception:
+        logger.exception(
+            "Failed to process referral start for user %s",
+            user.id,
+        )
+
+        await message.answer(
+            "خطا در راه‌اندازی ربات رخ داد. لطفاً دوباره /start را بزنید."
+        )
+
+
+# ============================================================
+# /start Without Referral
+# ============================================================
+
+@router.message(CommandStart())
+async def cmd_start(message: Message):
+    user = message.from_user
+
+    if not user:
+        return
+
+    # بررسی مسدود بودن کاربر
+    if is_banned(user.id):
+        await message.answer(
+            "⛔ شما از استفاده از ربات محروم شده‌اید."
         )
         return
 
     # محدودیت درخواست
     if not rate_limiter.is_allowed(user.id):
         await message.answer(
-            "لطفاً کمی صبر کنید و دوباره تلاش کنید."
+            "⏳ لطفاً کمی صبر کنید و دوباره تلاش کنید."
         )
         return
 
     try:
         # ثبت یا به‌روزرسانی کاربر
-        is_new = register_user(message)
+        register_user(message)
 
-        # پردازش رفرال فقط برای کاربر جدید
-        if is_new and referral_payload:
-
-            referrer_id = extract_referrer_id(
-                referral_payload,
-                user.id
-            )
-
-            if referrer_id:
-
-                try:
-                    referrer = get_user(referrer_id)
-
-                    if referrer:
-                        registered = set_referral(
-                            referrer_id,
-                            user.id
-                        )
-
-                        if registered:
-                            logger.info(
-                                "Referral registered: %s -> %s",
-                                referrer_id,
-                                user.id
-                            )
-
-                            log_event(
-                                "INFO",
-                                "referral_registered",
-                                user.id,
-                                f"Direct referrer: {referrer_id}"
-                            )
-
-                    else:
-                        logger.warning(
-                            "Referral ignored: referrer %s does not exist.",
-                            referrer_id
-                        )
-
-                except Exception:
-                    logger.exception(
-                        "Referral registration failed for user %s",
-                        user.id
-                    )
-
-        # ثبت فعالیت
+        # ثبت فعالیت روزانه
         record_user_activity(user.id)
 
-        # ارسال پیام جدید منوی اصلی
+        # ارسال منوی اصلی Rich
         await send_main_menu(message)
 
         logger.info(
-            "Main menu sent to user %s",
+            "Main Rich Menu sent to user %s",
             user.id
         )
 
     except Exception:
         logger.exception(
-            "Failed to process start for user %s",
+            "Failed to process /start for user %s",
             user.id
         )
 
@@ -216,36 +254,11 @@ async def process_start(
 
 
 # ============================================================
-# /START WITH REFERRAL
-# ============================================================
-
-@router.message(CommandStart(deep_link=True))
-async def cmd_start_with_referral(
-    message: Message,
-    command: CommandObject
-):
-    await process_start(
-        message,
-        referral_payload=command.args
-    )
-
-
-# ============================================================
-# /START WITHOUT REFERRAL
-# ============================================================
-
-@router.message(CommandStart())
-async def cmd_start(message: Message):
-    await process_start(message)
-
-
-# ============================================================
-# RETURN TO MAIN MENU
+# Return To Main Menu
 # ============================================================
 
 @router.callback_query(F.data == "menu:main")
 async def callback_main_menu(callback: CallbackQuery):
-
     user = callback.from_user
 
     if not user:
@@ -255,14 +268,14 @@ async def callback_main_menu(callback: CallbackQuery):
     # بررسی مسدود بودن کاربر
     if is_banned(user.id):
         await callback.answer(
-            "دسترسی شما به ربات مسدود شده است.",
+            "⛔ شما از استفاده از ربات محروم شده‌اید.",
             show_alert=True
         )
         return
 
     if not isinstance(callback.message, Message):
         await callback.answer(
-            "امکان نمایش منوی اصلی وجود ندارد.",
+            "امکان ارسال منوی اصلی وجود ندارد.",
             show_alert=True
         )
         return
@@ -271,41 +284,43 @@ async def callback_main_menu(callback: CallbackQuery):
         # ثبت فعالیت
         record_user_activity(user.id)
 
-        # ساخت منوی جدید با نام کاربر
+        # ساخت مجدد منوی اصلی Rich
         rich_message = create_main_menu_message(
             user.first_name
         )
 
-        # ارسال پیام جدید؛ پیام قبلی دست‌نخورده می‌ماند.
+        # ارسال پیام جدید؛ پیام قبلی ویرایش نمی‌شود.
         await callback.message.answer_rich(
             rich_message=rich_message
         )
 
         await callback.answer()
 
-        logger.info(
-            "New main menu message sent to user %s",
-            user.id
-        )
+    except TelegramBadRequest as error:
+        error_text = str(error).lower()
 
-    except TelegramBadRequest:
+        # اگر پیام از قبل همین منو باشد، خطا محسوب نمی‌شود.
+        if "message is not modified" in error_text:
+            await callback.answer()
+            return
+
         logger.exception(
-            "Telegram rejected main menu message for user %s",
+            "Telegram rejected main menu send for user %s",
             user.id
         )
 
         await callback.answer(
-            "خطا در ارسال منوی اصلی.",
+            "خطا در بازگشت به منوی اصلی.",
             show_alert=True
         )
 
     except Exception:
         logger.exception(
-            "Failed to send main menu to user %s",
+            "Failed to return user %s to main menu",
             user.id
         )
 
         await callback.answer(
-            "خطای غیرمنتظره در ارسال منوی اصلی.",
+            "خطای غیرمنتظره در بازگشت به منو.",
             show_alert=True
         )
