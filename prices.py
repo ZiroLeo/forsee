@@ -1,147 +1,768 @@
+
 import logging
+import re
+from typing import Optional
+
 from aiogram import Router, F
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import (
+    CallbackQuery,
+    Message,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
-from config import ADMIN_ID
-from database import get_setting, set_setting, log_event
-from rich import build_rich_message, premium_emoji, build_button_row, build_button
-from utils import rate_limiter
+from config import (
+    ADMIN_ID,
+    PREMIUM_EMOJIS,
+    PREMIUM_EMOJI_ENABLED,
+)
+
+from database import (
+    get_setting,
+    set_setting,
+    log_event,
+)
+
 
 logger = logging.getLogger(__name__)
 router = Router(name="admin_prices")
 
+
+# ============================================================
+# STATES
+# ============================================================
 
 class PriceStates(StatesGroup):
     waiting_value = State()
 
 
 # ============================================================
-# منوی تغییر قیمت
+# PRICE DEFINITIONS
 # ============================================================
 
-@router.callback_query(F.data == "admin:prices:menu")
-async def prices_menu(callback: CallbackQuery):
-    user = callback.from_user
-    if not user or user.id != ADMIN_ID:
-        log_event("SECURITY", "unauthorized_prices_access", user.id if user else 0)
-        await callback.answer("دسترسی غیرمجاز.", show_alert=True)
+PRICE_ITEMS = {
+    "per_gb": {
+        "title": "هر گیگ سرویس حجمی",
+        "description": "قیمت پایه هر گیگ سرویس حجمی",
+        "toman_key": "price_per_gb",
+        "stars_key": "stars_per_gb",
+        "default_toman": 5000,
+        "default_stars": 2,
+        "emoji": "blue_dot",
+    },
+
+    "vol_device": {
+        "title": "هر یوزر اضافه حجمی",
+        "description": "هزینه هر دستگاه اضافه در سرویس حجمی",
+        "toman_key": "per_device_vol_price",
+        "stars_key": "per_device_vol_stars",
+        "default_toman": 15000,
+        "default_stars": 5,
+        "emoji": "telegram",
+    },
+
+    "unl_device": {
+        "title": "هر یوزر اضافه نامحدود",
+        "description": "هزینه هر دستگاه اضافه در سرویس نامحدود",
+        "toman_key": "per_device_unl_price",
+        "stars_key": "per_device_unl_stars",
+        "default_toman": 15000,
+        "default_stars": 5,
+        "emoji": "world",
+    },
+
+    "vol_month": {
+        "title": "هر ماه اضافه حجمی",
+        "description": "هزینه هر ماه اضافه در سرویس حجمی",
+        "toman_key": "per_month_vol_price",
+        "stars_key": "per_month_vol_stars",
+        "default_toman": 30000,
+        "default_stars": 10,
+        "emoji": "light",
+    },
+
+    "unl_month": {
+        "title": "هر ماه اضافه نامحدود",
+        "description": "هزینه هر ماه اضافه در سرویس نامحدود",
+        "toman_key": "per_month_unl_price",
+        "stars_key": "per_month_unl_stars",
+        "default_toman": 30000,
+        "default_stars": 10,
+        "emoji": "diamond",
+    },
+
+    "no_expiry_gb": {
+        "title": "هر گیگ بدون محدودیت زمانی",
+        "description": "قیمت هر گیگ سرویس بدون انقضای زمانی",
+        "toman_key": "price_per_gb_no_expiry",
+        "stars_key": "stars_per_gb_no_expiry",
+        "default_toman": 7000,
+        "default_stars": 3,
+        "emoji": "safe",
+    },
+}
+
+
+CURRENCIES = {
+    "toman": {
+        "title": "تومان",
+        "symbol": "تومان",
+        "key_type": "toman_key",
+        "emoji": "wallet",
+    },
+    "stars": {
+        "title": "استارز",
+        "symbol": "Stars",
+        "key_type": "stars_key",
+        "emoji": "stars",
+    },
+}
+
+
+MAX_TOMAN_PRICE = 500_000_000
+MAX_STARS_PRICE = 1_000_000
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def is_admin(user_id: Optional[int]) -> bool:
+    return user_id is not None and user_id == ADMIN_ID
+
+
+def get_emoji_id(key: str) -> Optional[str]:
+    if not PREMIUM_EMOJI_ENABLED:
+        return None
+
+    emoji_id = PREMIUM_EMOJIS.get(key)
+
+    if not emoji_id:
+        return None
+
+    return str(emoji_id)
+
+
+def make_button(
+    text: str,
+    callback_data: str,
+    style: str = "primary",
+    emoji_key: Optional[str] = None,
+) -> InlineKeyboardButton:
+    if style not in ("primary", "success", "danger"):
+        raise ValueError("Invalid button style")
+
+    kwargs = {
+        "text": text,
+        "callback_data": callback_data,
+        "style": style,
+    }
+
+    if emoji_key:
+        emoji_id = get_emoji_id(emoji_key)
+
+        if emoji_id:
+            kwargs["icon_custom_emoji_id"] = emoji_id
+
+    return InlineKeyboardButton(**kwargs)
+
+
+def keyboard(
+    rows: list[list[InlineKeyboardButton]],
+) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def read_price(key: str, default: int) -> int:
+    try:
+        value = get_setting(key, str(default))
+        result = int(value)
+
+        if result < 0:
+            return default
+
+        return result
+
+    except (TypeError, ValueError):
+        logger.warning("Invalid price setting: %s", key)
+        return default
+
+    except Exception:
+        logger.exception("Could not read price setting: %s", key)
+        return default
+
+
+def format_number(value: int) -> str:
+    return f"{value:,}"
+
+
+def normalize_digits(value: str) -> str:
+    translation = str.maketrans(
+        "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩",
+        "01234567890123456789",
+    )
+
+    return value.translate(translation)
+
+
+def parse_price(value: str, currency: str) -> Optional[int]:
+    value = normalize_digits(value.strip())
+    value = value.replace(",", "").replace("٬", "").replace(" ", "")
+
+    if not re.fullmatch(r"[0-9]+", value):
+        return None
+
+    try:
+        amount = int(value)
+    except ValueError:
+        return None
+
+    if amount <= 0:
+        return None
+
+    if currency == "toman" and amount > MAX_TOMAN_PRICE:
+        return None
+
+    if currency == "stars" and amount > MAX_STARS_PRICE:
+        return None
+
+    return amount
+
+
+def get_item_prices(item_key: str) -> tuple[int, int]:
+    item = PRICE_ITEMS[item_key]
+
+    toman = read_price(
+        item["toman_key"],
+        item["default_toman"],
+    )
+
+    stars = read_price(
+        item["stars_key"],
+        item["default_stars"],
+    )
+
+    return toman, stars
+
+
+def log_price_change(
+    user_id: int,
+    item_key: str,
+    currency: str,
+    old_value: int,
+    new_value: int,
+) -> None:
+    try:
+        log_event(
+            "INFO",
+            "price_updated",
+            user_id,
+            (
+                f"item={item_key}; "
+                f"currency={currency}; "
+                f"old={old_value}; "
+                f"new={new_value}"
+            ),
+        )
+
+    except Exception:
+        logger.exception("Could not log price update")
+
+
+async def check_callback_admin(callback: CallbackQuery) -> bool:
+    if not is_admin(callback.from_user.id if callback.from_user else None):
+        try:
+            await callback.answer(
+                "⛔ دسترسی غیرمجاز است.",
+                show_alert=True,
+            )
+        except Exception:
+            logger.exception("Could not answer unauthorized callback")
+
+        return False
+
+    return True
+
+
+# ============================================================
+# MAIN PRICE MENU
+# ============================================================
+
+def prices_menu_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [
+            make_button(
+                "هر گیگ حجمی",
+                "admin:prices:edit:per_gb",
+                "primary",
+                "blue_dot",
+            ),
+            make_button(
+                "هر گیگ بدون زمان",
+                "admin:prices:edit:no_expiry_gb",
+                "primary",
+                "safe",
+            ),
+        ],
+        [
+            make_button(
+                "یوزر اضافه حجمی",
+                "admin:prices:edit:vol_device",
+                "primary",
+                "telegram",
+            ),
+            make_button(
+                "یوزر اضافه نامحدود",
+                "admin:prices:edit:unl_device",
+                "primary",
+                "world",
+            ),
+        ],
+        [
+            make_button(
+                "ماه اضافه حجمی",
+                "admin:prices:edit:vol_month",
+                "primary",
+                "light",
+            ),
+            make_button(
+                "ماه اضافه نامحدود",
+                "admin:prices:edit:unl_month",
+                "primary",
+                "diamond",
+            ),
+        ],
+        [
+            make_button(
+                "بازگشت به پنل",
+                "admin:main",
+                "danger",
+                "back",
+            ),
+        ],
+    ]
+
+    return keyboard(rows)
+
+
+def get_prices_menu_text() -> str:
+    lines = [
+        "💰 مدیریت قیمت‌گذاری",
+        "━━━━━━━━━━━━━━━━━━",
+        "",
+        "قیمت‌های فعلی ربات:",
+        "",
+    ]
+
+    for item_key, item in PRICE_ITEMS.items():
+        toman, stars = get_item_prices(item_key)
+
+        lines.extend([
+            f"🔹 {item['title']}",
+            f"   {format_number(toman)} تومان",
+            f"   ⭐ {format_number(stars)} Stars",
+            "",
+        ])
+
+    lines.extend([
+        "━━━━━━━━━━━━━━━━━━",
+        "برای تغییر قیمت، مؤلفه موردنظر را انتخاب کن.",
+        "",
+        "قیمت تومان و Stars کاملاً مستقل هستند.",
+    ])
+
+    return "\n".join(lines)
+
+
+async def show_prices_menu(
+    callback: CallbackQuery,
+    state: Optional[FSMContext] = None,
+) -> None:
+    if not await check_callback_admin(callback):
         return
 
-    # نمایش قیمت‌های فعلی
-    text = (
-        f"{premium_emoji('light', '💰')} **مدیریت قیمت‌ها**\n\n"
-        f"قیمت‌های فعلی (تومان / Stars):\n"
-        f"• هر گیگ: {get_setting('price_per_gb', '5000')} / {get_setting('stars_per_gb', '2')}\n"
-        f"• هر ماه اضافه: {get_setting('per_month_price', '30000')} / {get_setting('per_month_stars', '10')}\n"
-        f"• هر یوزر اضافه: {get_setting('per_device_price', '15000')} / {get_setting('per_device_stars', '5')}\n"
-        f"• نامحدود ۱۵۰G: {get_setting('unlimited_150_price', '120000')} / {get_setting('unlimited_150_stars', '80')}\n"
-        f"• نامحدود بی‌نهایت: {get_setting('unlimited_inf_price', '350000')} / {get_setting('unlimited_inf_stars', '110')}\n\n"
-        f"برای تغییر، روی دکمه مربوطه بزنید:"
-    )
-    rows = [
-        build_button_row([
-            build_button("هر گیگ", callback_data="admin:prices:edit:per_gb", style="primary"),
-        ]),
-        build_button_row([
-            build_button("هر ماه اضافه", callback_data="admin:prices:edit:per_month", style="primary"),
-        ]),
-        build_button_row([
-            build_button("هر یوزر اضافه", callback_data="admin:prices:edit:per_device", style="primary"),
-        ]),
-        build_button_row([
-            build_button("نامحدود ۱۵۰G", callback_data="admin:prices:edit:unlimited_150", style="primary"),
-        ]),
-        build_button_row([
-            build_button("نامحدود بی‌نهایت", callback_data="admin:prices:edit:unlimited_inf", style="primary"),
-        ]),
-        build_button_row([
-            build_button("بازگشت", callback_data="admin:main", style="danger", premium_emoji_key="back"),
-        ]),
-    ]
-    await callback.message.edit_text(rich_message=build_rich_message(text, rows))
+    if state:
+        await state.clear()
+
+    try:
+        if callback.message:
+            await callback.message.edit_text(
+                text=get_prices_menu_text(),
+                reply_markup=prices_menu_keyboard(),
+            )
+        else:
+            await callback.bot.send_message(
+                chat_id=callback.from_user.id,
+                text=get_prices_menu_text(),
+                reply_markup=prices_menu_keyboard(),
+            )
+
+    except Exception:
+        logger.exception("Could not display prices menu")
+
+        try:
+            await callback.bot.send_message(
+                chat_id=callback.from_user.id,
+                text=get_prices_menu_text(),
+                reply_markup=prices_menu_keyboard(),
+            )
+        except Exception:
+            logger.exception("Could not send prices menu fallback")
+
     await callback.answer()
 
 
 # ============================================================
-# انتخاب آیتم → دریافت مقدار جدید
+# CURRENCY SELECTION
+# ============================================================
+
+def currency_selection_keyboard(item_key: str) -> InlineKeyboardMarkup:
+    return keyboard([
+        [
+            make_button(
+                "تغییر قیمت تومانی",
+                f"admin:prices:currency:{item_key}:toman",
+                "success",
+                "wallet",
+            ),
+            make_button(
+                "تغییر قیمت Stars",
+                f"admin:prices:currency:{item_key}:stars",
+                "primary",
+                "stars",
+            ),
+        ],
+        [
+            make_button(
+                "بازگشت به قیمت‌ها",
+                "admin:prices:menu",
+                "danger",
+                "back",
+            ),
+        ],
+    ])
+
+
+@router.callback_query(F.data == "admin:prices:menu")
+async def prices_menu_callback(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+    await show_prices_menu(callback, state)
+
+
+# ============================================================
+# SELECT PRICE ITEM
 # ============================================================
 
 @router.callback_query(F.data.startswith("admin:prices:edit:"))
-async def edit_price_item(callback: CallbackQuery, state: FSMContext):
-    user = callback.from_user
-    if not user or user.id != ADMIN_ID:
-        await callback.answer("دسترسی غیرمجاز.", show_alert=True)
+async def select_price_item(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+    if not await check_callback_admin(callback):
         return
 
-    item = callback.data.split(":")[3]
-    await state.update_data(price_item=item)
-    await state.set_state(PriceStates.waiting_value)
+    item_key = callback.data.split(":")[-1]
 
-    labels = {
-        "per_gb": "هر گیگ",
-        "per_month": "هر ماه اضافه",
-        "per_device": "هر یوزر اضافه",
-        "unlimited_150": "نامحدود ۱۵۰G",
-        "unlimited_inf": "نامحدود بی‌نهایت",
-    }
-    label = labels.get(item, item)
+    item = PRICE_ITEMS.get(item_key)
+
+    if not item:
+        await callback.answer(
+            "آیتم قیمت‌گذاری نامعتبر است.",
+            show_alert=True,
+        )
+        return
+
+    await state.clear()
+    await state.update_data(price_item=item_key)
+
+    toman, stars = get_item_prices(item_key)
 
     text = (
-        f"{premium_emoji('light', '💰')} **تغییر قیمت: {label}**\n\n"
-        f"لطفاً مقدار جدید را به صورت **تومان و Stars** با فرمت `تومان/استارز` وارد کنید.\n"
-        f"مثال: `6000/3`"
+        "💰 انتخاب نوع قیمت\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"مؤلفه: {item['title']}\n\n"
+        f"قیمت فعلی تومانی: {format_number(toman)} تومان\n"
+        f"قیمت فعلی Stars: {format_number(stars)} Stars\n\n"
+        "مشخص کن کدام قیمت را می‌خواهی تغییر بدهی."
     )
-    await callback.message.edit_text(rich_message=build_rich_message(text))
+
+    try:
+        await callback.message.edit_text(
+            text=text,
+            reply_markup=currency_selection_keyboard(item_key),
+        )
+
+    except Exception:
+        logger.exception("Could not display currency selection")
+
     await callback.answer()
 
 
-@router.message(PriceStates.waiting_value)
-async def receive_price_value(message: Message, state: FSMContext):
-    user = message.from_user
-    if not user or user.id != ADMIN_ID:
-        return
+# ============================================================
+# ASK NEW PRICE
+# ============================================================
 
-    text = (message.text or "").strip()
-    if "/" not in text:
-        await message.answer("❌ فرمت نامعتبر. لطفاً به صورت `تومان/استارز` وارد کنید. مثال: `6000/3`")
-        return
+async def ask_new_price(
+    callback: CallbackQuery,
+    state: FSMContext,
+    item_key: str,
+    currency: str,
+):
+    item = PRICE_ITEMS[item_key]
+    currency_info = CURRENCIES[currency]
 
-    parts = text.split("/", 1)
+    toman, stars = get_item_prices(item_key)
+
+    current_value = toman if currency == "toman" else stars
+    current_label = (
+        f"{format_number(current_value)} {currency_info['symbol']}"
+    )
+
+    await state.update_data(
+        price_item=item_key,
+        price_currency=currency,
+    )
+
+    await state.set_state(PriceStates.waiting_value)
+
+    text = (
+        "✏️ تغییر قیمت\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"مؤلفه: {item['title']}\n"
+        f"نوع قیمت: {currency_info['title']}\n"
+        f"قیمت فعلی: {current_label}\n\n"
+        "مقدار جدید را فقط به‌صورت عدد ارسال کن.\n\n"
+        "مثال: 50000\n\n"
+        "برای لغو، از دکمه زیر استفاده کن."
+    )
+
+    cancel_keyboard = keyboard([
+        [
+            make_button(
+                "لغو عملیات",
+                "admin:prices:cancel",
+                "danger",
+                "false",
+            ),
+        ],
+    ])
+
     try:
-        toman = int(parts[0].strip())
-        stars = int(parts[1].strip())
-    except (ValueError, TypeError):
-        await message.answer("❌ مقادیر باید عدد صحیح باشند.")
+        await callback.message.edit_text(
+            text=text,
+            reply_markup=cancel_keyboard,
+        )
+
+    except Exception:
+        logger.exception("Could not display price input prompt")
+
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:prices:currency:"))
+async def select_currency(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+    if not await check_callback_admin(callback):
         return
 
-    if toman <= 0 or stars <= 0 or toman > 100_000_000 or stars > 1_000_000:
-        await message.answer("❌ مقادیر خارج از محدوده مجاز هستند.")
+    parts = callback.data.split(":")
+
+    if len(parts) != 5:
+        await callback.answer(
+            "درخواست نامعتبر است.",
+            show_alert=True,
+        )
+        return
+
+    item_key = parts[3]
+    currency = parts[4]
+
+    if item_key not in PRICE_ITEMS or currency not in CURRENCIES:
+        await callback.answer(
+            "انتخاب نامعتبر است.",
+            show_alert=True,
+        )
+        return
+
+    await ask_new_price(
+        callback,
+        state,
+        item_key,
+        currency,
+    )
+
+
+# ============================================================
+# RECEIVE NEW PRICE
+# ============================================================
+
+@router.message(PriceStates.waiting_value)
+async def receive_new_price(
+    message: Message,
+    state: FSMContext,
+):
+    user = message.from_user
+
+    if not user or not is_admin(user.id):
         return
 
     data = await state.get_data()
-    item = data.get("price_item")
 
-    # نگاشت به کلیدهای settings
-    mapping = {
-        "per_gb": ("price_per_gb", "stars_per_gb"),
-        "per_month": ("per_month_price", "per_month_stars"),
-        "per_device": ("per_device_price", "per_device_stars"),
-        "unlimited_150": ("unlimited_150_price", "unlimited_150_stars"),
-        "unlimited_inf": ("unlimited_inf_price", "unlimited_inf_stars"),
-    }
-    keys = mapping.get(item)
-    if not keys:
-        await message.answer("❌ آیتم نامعتبر.")
+    item_key = data.get("price_item")
+    currency = data.get("price_currency")
+
+    if item_key not in PRICE_ITEMS or currency not in CURRENCIES:
         await state.clear()
+
+        await message.answer(
+            "❌ اطلاعات عملیات قیمت‌گذاری معتبر نیست. دوباره از پنل وارد شو."
+        )
         return
 
-    set_setting(keys[0], str(toman))
-    set_setting(keys[1], str(stars))
-    log_event("INFO", "price_updated", user.id, f"{item}: {toman}/{stars}")
+    raw_value = message.text or ""
+
+    amount = parse_price(raw_value, currency)
+
+    if amount is None:
+        if currency == "toman":
+            limit_text = f"حداکثر {MAX_TOMAN_PRICE:,} تومان"
+        else:
+            limit_text = f"حداکثر {MAX_STARS_PRICE:,} Stars"
+
+        await message.answer(
+            "❌ مبلغ واردشده معتبر نیست.\n\n"
+            "لطفاً فقط عدد صحیح مثبت ارسال کن.\n"
+            f"محدوده مجاز: {limit_text}"
+        )
+        return
+
+    item = PRICE_ITEMS[item_key]
+    currency_info = CURRENCIES[currency]
+
+    setting_key = item[currency_info["key_type"]]
+
+    old_value = read_price(
+        setting_key,
+        (
+            item["default_toman"]
+            if currency == "toman"
+            else item["default_stars"]
+        ),
+    )
+
+    try:
+        set_setting(setting_key, str(amount))
+
+    except Exception:
+        logger.exception(
+            "Could not save price setting: %s",
+            setting_key,
+        )
+
+        await message.answer(
+            "❌ ذخیره قیمت ناموفق بود. دیتابیس را بررسی کن."
+        )
+        return
+
+    log_price_change(
+        user.id,
+        item_key,
+        currency,
+        old_value,
+        amount,
+    )
 
     await state.clear()
-    await message.answer(
-        f"{premium_emoji('true', '✅')} **قیمت {item} با موفقیت به {toman:,} تومان / {stars} Stars تغییر کرد.**"
+
+    toman, stars = get_item_prices(item_key)
+
+    success_text = (
+        "✅ قیمت با موفقیت تغییر کرد.\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"مؤلفه: {item['title']}\n"
+        f"قیمت قبلی: {format_number(old_value)} "
+        f"{currency_info['symbol']}\n"
+        f"قیمت جدید: {format_number(amount)} "
+        f"{currency_info['symbol']}\n\n"
+        "قیمت‌های فعلی این مؤلفه:\n"
+        f"تومان: {format_number(toman)}\n"
+        f"Stars: {format_number(stars)}"
     )
+
+    await message.answer(
+        success_text,
+        reply_markup=keyboard([
+            [
+                make_button(
+                    "مدیریت سایر قیمت‌ها",
+                    "admin:prices:menu",
+                    "primary",
+                    "shop",
+                ),
+            ],
+            [
+                make_button(
+                    "بازگشت به پنل",
+                    "admin:main",
+                    "danger",
+                    "back",
+                ),
+            ],
+        ]),
+    )
+
+    logger.info(
+        "Admin %s updated %s (%s): %s -> %s",
+        user.id,
+        item_key,
+        currency,
+        old_value,
+        amount,
+    )
+
+
+# ============================================================
+# CANCEL PRICE EDIT
+# ============================================================
+
+@router.callback_query(F.data == "admin:prices:cancel")
+async def cancel_price_edit(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+    if not await check_callback_admin(callback):
+        return
+
+    await state.clear()
+
+    try:
+        await callback.message.edit_text(
+            text="❌ عملیات تغییر قیمت لغو شد.",
+            reply_markup=keyboard([
+                [
+                    make_button(
+                        "بازگشت به قیمت‌ها",
+                        "admin:prices:menu",
+                        "primary",
+                        "shop",
+                    ),
+                    make_button(
+                        "بازگشت به پنل",
+                        "admin:main",
+                        "danger",
+                        "back",
+                    ),
+                ],
+            ]),
+        )
+
+    except Exception:
+        logger.exception("Could not cancel price edit")
+
+    await callback.answer("عملیات لغو شد.")
