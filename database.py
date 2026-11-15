@@ -1,8 +1,26 @@
-import sqlite3
-import time
+"""
+database.py
+-----------
+لایهٔ دیتابیس (SQLite) ربات.
+
+اصول امنیتی و پایداری:
+* همهٔ کوئری‌ها پارامتریک هستند (بدون ساخت SQL با رشته‌های ورودی کاربر).
+* هر اتصال بعد از استفاده بسته می‌شود (نشت اتصال ندارد).
+* تغییرات مالی (کیف پول، پرداخت، تخفیف) داخل تراکنش BEGIN IMMEDIATE انجام می‌شود.
+* ورودی‌ها قبل از ذخیره اعتبارسنجی و پاک‌سازی می‌شوند؛ جستجوها LIKE-escape دارند.
+* log_event هرگز استثنا نمی‌اندازد (خطای لاگ نباید جلوی کار اصلی را بگیرد).
+* فایل دیتابیس با دسترسی ۶۰۰ ساخته می‌شود و بک‌آپ با API رسمی SQLite (سازگار با WAL) گرفته می‌شود.
+* مهاجرت‌ها فقط افزایشی‌اند (ستون/جدول جدید)؛ هیچ دیتایی پاک یا بازنویسی نمی‌شود.
+
+همهٔ توابع قبلی با همان نام و امضا باقی مانده‌اند؛ توابع جدید در انتهای فایل هستند.
+"""
+
+import os
 import re
+import time
+import sqlite3
 import logging
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Tuple
 
 from config import DB_PATH
 
@@ -12,14 +30,31 @@ logger = logging.getLogger(__name__)
 # اتصال امن
 # ============================================================
 
+class _SafeConnection(sqlite3.Connection):
+    """
+    رفتار `with get_connection() as conn` در sqlite3 فقط commit/rollback می‌کند و
+    اتصال را باز می‌گذارد. این کلاس بعد از commit/rollback اتصال را می‌بندد.
+    """
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            return super().__exit__(exc_type, exc, tb)
+        finally:
+            try:
+                self.close()
+            except Exception:
+                pass
+
+
 def get_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    conn = sqlite3.connect(DB_PATH, timeout=30.0, factory=_SafeConnection)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA foreign_keys=ON;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA busy_timeout=30000;")
     conn.execute("PRAGMA secure_delete=ON;")
+    conn.execute("PRAGMA trusted_schema=OFF;")
     return conn
 
 # ============================================================
@@ -56,6 +91,16 @@ def validate_amount(amount, max_val: int = 500_000_000) -> int:
 
 def now_ts() -> int:
     return int(time.time())
+
+def _like_escape(text: str) -> str:
+    """escape کردن % _ \\ برای LIKE ... ESCAPE '\\'."""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    """ستون را فقط اگر وجود ندارد اضافه می‌کند (نام‌ها ثابت و داخلی‌اند، نه ورودی کاربر)."""
+    cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
 # ============================================================
 # ساخت جداول
@@ -302,6 +347,40 @@ def init_database() -> None:
             )
         """)
 
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS price_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                item TEXT NOT NULL,
+                currency TEXT NOT NULL CHECK (currency IN ('toman', 'stars')),
+                old_value INTEGER,
+                new_value INTEGER NOT NULL,
+                changed_by INTEGER,
+                created_at INTEGER NOT NULL
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS admin_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                target TEXT,
+                detail TEXT,
+                created_at INTEGER NOT NULL
+            )
+        """)
+
+        # مهاجرت‌های افزایشی (روی دیتابیس موجود امن است)
+        _ensure_column(conn, "bans", "unbanned_by", "INTEGER")
+        _ensure_column(conn, "bans", "unbanned_at", "INTEGER")
+        _ensure_column(conn, "payment_requests", "review_note", "TEXT")
+
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_price_hist ON price_history(item, currency, id);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_created ON admin_audit(created_at);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username COLLATE NOCASE);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_users_banned ON users(is_banned);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pay_created ON payment_requests(created_at);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_subs_created ON subscriptions(created_at);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_subs_user ON subscriptions(telegram_id);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_subs_state ON subscriptions(state);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_subs_expires ON subscriptions(expires_at);")
@@ -321,6 +400,13 @@ def init_database() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_activity_date ON user_activity(activity_date);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_wheel_telegram ON lucky_wheel_spins(telegram_id);")
 
+    # دسترسی فایل دیتابیس فقط برای صاحب برنامه
+    try:
+        os.chmod(DB_PATH, 0o600)
+    except Exception:
+        logger.debug("Could not chmod database file", exc_info=True)
+
+
 # ============================================================
 # تنظیمات
 # ============================================================
@@ -331,11 +417,17 @@ def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
         return row["value"] if row else default
 
 def set_setting(key: str, value: str) -> None:
+    key = str(key)
+    if not key or len(key) > 200:
+        raise ValueError("Invalid setting key")
+    value = str(value)
+    if len(value) > 20000:
+        raise ValueError("Setting value too long")
     with get_connection() as conn:
         conn.execute(
             "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-            (key, str(value), now_ts())
+            (key, value, now_ts())
         )
 
 # ============================================================
@@ -343,11 +435,16 @@ def set_setting(key: str, value: str) -> None:
 # ============================================================
 
 def log_event(level: str, event_type: str, user_id: Optional[int] = None, detail: Optional[str] = None) -> None:
-    with get_connection() as conn:
-        conn.execute(
-            "INSERT INTO logs (level, event_type, user_id, detail, created_at) VALUES (?, ?, ?, ?, ?)",
-            (level, event_type, user_id, sanitize_text(detail, 1000), now_ts())
-        )
+    """ثبت لاگ. هرگز استثنا نمی‌اندازد."""
+    try:
+        with get_connection() as conn:
+            conn.execute(
+                "INSERT INTO logs (level, event_type, user_id, detail, created_at) VALUES (?, ?, ?, ?, ?)",
+                (sanitize_text(level, 20) or "INFO", sanitize_text(event_type, 100) or "event",
+                 user_id, sanitize_text(detail, 1000), now_ts())
+            )
+    except Exception:
+        logger.exception("log_event failed: %s", event_type)
 
 # ============================================================
 # کاربران
@@ -501,6 +598,9 @@ def get_balance(telegram_id: int) -> int:
 
 def change_balance(telegram_id: int, delta: int, tx_type: str, description: str = "", reference_id: Optional[str] = None) -> bool:
     telegram_id = validate_telegram_id(telegram_id)
+    delta = int(delta)
+    if delta == 0 or abs(delta) > 500_000_000:
+        return False
     with get_connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -830,7 +930,11 @@ def get_referral_details(referrer_id: int, limit: int = 100) -> List[Dict[str, A
 
 def create_discount_code(code: str, percent: int, max_uses: int) -> Optional[int]:
     code = sanitize_text(code, 50)
-    if not code or not (1 <= percent <= 100) or max_uses <= 0:
+    try:
+        percent, max_uses = int(percent), int(max_uses)
+    except (TypeError, ValueError):
+        return None
+    if not code or not (1 <= percent <= 100) or not (1 <= max_uses <= 1_000_000):
         return None
     with get_connection() as conn:
         try:
@@ -879,6 +983,9 @@ def consume_discount_code(code_id: int, telegram_id: int) -> bool:
 
 def ban_user(telegram_id: int, admin_id: int, reason: str = "", until: Optional[int] = None) -> bool:
     telegram_id = validate_telegram_id(telegram_id)
+    admin_id = validate_telegram_id(admin_id)
+    if until is not None:
+        until = int(until)
     with get_connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -894,12 +1001,15 @@ def ban_user(telegram_id: int, admin_id: int, reason: str = "", until: Optional[
             conn.rollback()
             raise
 
-def unban_user(telegram_id: int) -> bool:
+def unban_user(telegram_id: int, admin_id: Optional[int] = None) -> bool:
     telegram_id = validate_telegram_id(telegram_id)
     with get_connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
-            conn.execute("UPDATE bans SET is_active = 0 WHERE telegram_id = ? AND is_active = 1", (telegram_id,))
+            conn.execute(
+                "UPDATE bans SET is_active = 0, unbanned_by = ?, unbanned_at = ? WHERE telegram_id = ? AND is_active = 1",
+                (admin_id, now_ts(), telegram_id)
+            )
             conn.execute("UPDATE users SET is_banned = 0, ban_until = NULL WHERE telegram_id = ?", (telegram_id,))
             conn.commit()
             return True
@@ -908,17 +1018,22 @@ def unban_user(telegram_id: int) -> bool:
             raise
 
 def is_banned(telegram_id: int) -> bool:
+    """
+    مسدود است اگر is_banned=1 باشد و (بن دائمی باشد یا مهلتش نگذشته باشد).
+    (نسخهٔ قبلی بن دائمی را اشتباهاً «غیرمسدود» می‌دانست.)
+    """
     telegram_id = validate_telegram_id(telegram_id)
     with get_connection() as conn:
-        row = conn.execute("SELECT ban_until FROM users WHERE telegram_id = ?", (telegram_id,)).fetchone()
-        if not row:
-            return False
-        if not row["ban_until"]:
-            return False
-        if row["ban_until"] < now_ts():
-            unban_user(telegram_id)
-            return False
-        return True
+        row = conn.execute(
+            "SELECT is_banned, ban_until FROM users WHERE telegram_id = ?", (telegram_id,)
+        ).fetchone()
+    if not row or not row["is_banned"]:
+        return False
+    until = row["ban_until"]
+    if until and int(until) < now_ts():
+        unban_user(telegram_id)
+        return False
+    return True
 
 # ============================================================
 # محصولات
@@ -962,6 +1077,10 @@ def save_daily_report(report_date: str, configs_sold: int, revenue_toman: int) -
             (report_date, configs_sold, revenue_toman, active, now_ts())
         )
 
+def _day_start() -> int:
+    t = time.localtime()
+    return int(time.mktime((t.tm_year, t.tm_mon, t.tm_mday, 0, 0, 0, 0, 0, -1)))
+
 # ============================================================
 # آمار
 # ============================================================
@@ -981,6 +1100,18 @@ def get_admin_stats() -> Dict[str, Any]:
             "total_balance": int(total_balance),
             "total_revenue_toman": int(total_revenue),
             "total_stars": int(total_stars),
+            "pending_payments": int(conn.execute(
+                "SELECT COUNT(*) AS c FROM payment_requests WHERE status = 'pending'").fetchone()["c"]),
+            "new_users_today": int(conn.execute(
+                "SELECT COUNT(*) AS c FROM users WHERE joined_at >= ?", (_day_start(),)).fetchone()["c"]),
+            "sales_today": int(conn.execute(
+                "SELECT COUNT(*) AS c FROM subscriptions WHERE is_trial = 0 AND created_at >= ?",
+                (_day_start(),)).fetchone()["c"]),
+            "revenue_today_toman": int(conn.execute(
+                "SELECT COALESCE(SUM(price_toman), 0) AS s FROM subscriptions WHERE is_trial = 0 AND created_at >= ?",
+                (_day_start(),)).fetchone()["s"]),
+            "active_subscriptions": int(conn.execute(
+                "SELECT COUNT(*) AS c FROM subscriptions WHERE state = 'active'").fetchone()["c"]),
         }
 
 # ============================================================
@@ -1016,3 +1147,420 @@ def record_wheel_spin(telegram_id: int, prize: str, prize_type: str, config_name
             (telegram_id, prize, prize_type, config_name, now_ts())
         )
         return cursor.lastrowid
+# ============================================================
+# ===================  توابع جدید (پنل ادمین)  ===================
+# ============================================================
+
+# ------------------------- قیمت‌ها -------------------------
+
+PRICE_ITEMS = (
+    "per_gb", "per_gb_nolimit",
+    "per_device_vol", "per_device_unl",
+    "per_month_vol", "per_month_unl",
+    "unlimited_150", "unlimited_inf",
+)
+PRICE_CURRENCIES = ("toman", "stars")
+_PRICE_MAX = {"toman": 1_000_000_000, "stars": 1_000_000}
+
+
+def price_setting_key(item: str, currency: str) -> str:
+    """کلید ذخیره در جدول settings (با pricing.py یکسان است)."""
+    return f"price_{item}_{currency}"
+
+
+def get_price_override(item: str, currency: str) -> Optional[int]:
+    """قیمت ذخیره‌شده توسط ادمین، یا None اگر تنظیم نشده باشد."""
+    if item not in PRICE_ITEMS or currency not in PRICE_CURRENCIES:
+        return None
+    raw = get_setting(price_setting_key(item, currency))
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
+def set_price(item: str, currency: str, value: int, admin_id: Optional[int] = None) -> bool:
+    """ذخیره قیمت جدید + ثبت در تاریخچهٔ قیمت (در یک تراکنش)."""
+    if item not in PRICE_ITEMS or currency not in PRICE_CURRENCIES:
+        raise ValueError("Unknown price item/currency")
+    value = int(value)
+    if value < 0 or value > _PRICE_MAX[currency]:
+        raise ValueError("Price out of range")
+    key = price_setting_key(item, currency)
+    with get_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+            try:
+                old = int(row["value"]) if row else None
+            except (TypeError, ValueError):
+                old = None
+            conn.execute(
+                "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                (key, str(value), now_ts())
+            )
+            conn.execute(
+                "INSERT INTO price_history (item, currency, old_value, new_value, changed_by, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (item, currency, old, value, admin_id, now_ts())
+            )
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def get_price_history(limit: int = 20, item: Optional[str] = None) -> List[Dict[str, Any]]:
+    limit = max(1, min(int(limit), 200))
+    with get_connection() as conn:
+        if item:
+            rows = conn.execute(
+                "SELECT * FROM price_history WHERE item = ? ORDER BY id DESC LIMIT ?", (item, limit)
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM price_history ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+
+# ------------------------- تنظیمات (ابزار) -------------------------
+
+def delete_setting(key: str) -> bool:
+    with get_connection() as conn:
+        return conn.execute("DELETE FROM settings WHERE key = ?", (str(key),)).rowcount > 0
+
+
+def get_int_setting(key: str, default: int = 0) -> int:
+    try:
+        return int(str(get_setting(key, default)).strip())
+    except (TypeError, ValueError):
+        return int(default)
+
+
+# ------------------------- ادمین رسید -------------------------
+
+def get_receipt_admin_id(default: int) -> int:
+    """شناسهٔ ادمین تاییدکنندهٔ رسیدها؛ اگر تنظیم نشده یا نامعتبر باشد: default."""
+    raw = get_setting("receipt_admin_id")
+    try:
+        value = int(str(raw).strip())
+        return value if 0 < value <= 10_000_000_000_000 else int(default)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def set_receipt_admin_id(new_admin_id: int, changed_by: Optional[int] = None) -> bool:
+    new_admin_id = validate_telegram_id(new_admin_id)
+    set_setting("receipt_admin_id", str(new_admin_id))
+    log_admin_action(changed_by or 0, "receipt_admin_set", str(new_admin_id))
+    return True
+
+
+# ------------------------- ثبت اقدامات ادمین -------------------------
+
+def log_admin_action(admin_id: int, action: str, target: Optional[str] = None, detail: Optional[str] = None) -> None:
+    """ردپای حسابرسی (audit). هرگز استثنا نمی‌اندازد."""
+    try:
+        with get_connection() as conn:
+            conn.execute(
+                "INSERT INTO admin_audit (admin_id, action, target, detail, created_at) VALUES (?, ?, ?, ?, ?)",
+                (int(admin_id or 0), sanitize_text(action, 100) or "action",
+                 sanitize_text(target, 200), sanitize_text(detail, 1000), now_ts())
+            )
+    except Exception:
+        logger.exception("log_admin_action failed: %s", action)
+
+
+def get_admin_actions(limit: int = 20) -> List[Dict[str, Any]]:
+    limit = max(1, min(int(limit), 200))
+    with get_connection() as conn:
+        rows = conn.execute("SELECT * FROM admin_audit ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def purge_old_logs(days: int = 90) -> int:
+    """حذف لاگ‌های قدیمی‌تر از N روز (برای کوچک ماندن دیتابیس)."""
+    days = max(7, int(days))
+    cutoff = now_ts() - days * 86400
+    with get_connection() as conn:
+        return conn.execute("DELETE FROM logs WHERE created_at < ?", (cutoff,)).rowcount
+
+
+# ------------------------- کاربران -------------------------
+
+def search_users(query: str, limit: int = 10) -> List[Dict[str, Any]]:
+    """جستجو با آیدی عددی (دقیق) یا بخشی از یوزرنیم/نام (LIKE امن)."""
+    query = sanitize_text(query, 100)
+    if not query:
+        return []
+    limit = max(1, min(int(limit), 50))
+    raw = query.lstrip("@")
+    results: List[Dict[str, Any]] = []
+    if re.fullmatch(r"[0-9]{1,15}", raw):
+        try:
+            user = get_user(int(raw))
+            if user:
+                results.append(user)
+        except ValueError:
+            pass
+    pattern = f"%{_like_escape(raw)}%"
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM users WHERE username LIKE ? ESCAPE '\\' COLLATE NOCASE "
+            "OR first_name LIKE ? ESCAPE '\\' COLLATE NOCASE ORDER BY total_purchases DESC LIMIT ?",
+            (pattern, pattern, limit)
+        ).fetchall()
+    seen = {u["telegram_id"] for u in results}
+    for row in rows:
+        if row["telegram_id"] not in seen:
+            results.append(dict(row))
+    return results[:limit]
+
+
+def count_user_subscriptions(telegram_id: int) -> int:
+    telegram_id = validate_telegram_id(telegram_id)
+    with get_connection() as conn:
+        return int(conn.execute(
+            "SELECT COUNT(*) AS c FROM subscriptions WHERE telegram_id = ?", (telegram_id,)
+        ).fetchone()["c"])
+
+
+def get_recent_subscriptions(telegram_id: int, limit: int = 7) -> List[Dict[str, Any]]:
+    """آخرین سرویس‌های کاربر (شامل حذف‌شده از لیست)."""
+    telegram_id = validate_telegram_id(telegram_id)
+    limit = max(1, min(int(limit), 50))
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM subscriptions WHERE telegram_id = ? ORDER BY id DESC LIMIT ?",
+            (telegram_id, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_ban_info(telegram_id: int) -> Dict[str, Any]:
+    telegram_id = validate_telegram_id(telegram_id)
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT reason, until, banned_by, created_at FROM bans "
+            "WHERE telegram_id = ? AND is_active = 1 ORDER BY id DESC LIMIT 1",
+            (telegram_id,),
+        ).fetchone()
+        return dict(row) if row else {}
+
+
+def get_user_profile(telegram_id: int) -> Optional[Dict[str, Any]]:
+    """اطلاعات کامل کاربر برای پنل ادمین: کاربر + سطح + تعداد سرویس + وضعیت بن."""
+    user = get_user(telegram_id)
+    if not user:
+        return None
+    level_key, level_name = get_user_level(int(user.get("total_purchases") or 0))
+    user["level_key"] = level_key
+    user["level_name"] = level_name
+    user["sub_count"] = count_user_subscriptions(user["telegram_id"])
+    user["banned"] = is_banned(user["telegram_id"])
+    user["ban_info"] = get_ban_info(user["telegram_id"]) if user["banned"] else {}
+    return user
+
+
+def list_users_page(page: int = 1, page_size: int = 5) -> Tuple[List[Dict[str, Any]], int]:
+    """صفحه‌بندی کاربران (بیشترین خرید اول) همراه با تعداد سرویس. خروجی: (کاربران، کل)."""
+    page = max(1, int(page))
+    page_size = max(1, min(int(page_size), 50))
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT u.telegram_id, u.username, u.first_name, u.balance, u.total_purchases, u.is_banned,
+                   (SELECT COUNT(*) FROM subscriptions s WHERE s.telegram_id = u.telegram_id) AS sub_count
+            FROM users u
+            ORDER BY u.total_purchases DESC, u.telegram_id ASC
+            LIMIT ? OFFSET ?
+            """,
+            (page_size, (page - 1) * page_size)
+        ).fetchall()
+        total = int(conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"])
+        return [dict(r) for r in rows], total
+
+
+def get_all_user_ids(include_banned: bool = False) -> List[int]:
+    """برای پیام همگانی."""
+    with get_connection() as conn:
+        if include_banned:
+            rows = conn.execute("SELECT telegram_id FROM users").fetchall()
+        else:
+            rows = conn.execute("SELECT telegram_id FROM users WHERE is_banned = 0").fetchall()
+        return [int(r["telegram_id"]) for r in rows]
+
+
+# ------------------------- رسیدها / پرداخت‌ها -------------------------
+
+def get_pending_payments(limit: int = 20) -> List[Dict[str, Any]]:
+    limit = max(1, min(int(limit), 100))
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM payment_requests WHERE status = 'pending' ORDER BY id ASC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_payment_stats() -> Dict[str, int]:
+    out = {"pending": 0, "approved": 0, "rejected": 0, "approved_amount": 0}
+    with get_connection() as conn:
+        for r in conn.execute(
+            "SELECT status, COUNT(*) AS c, COALESCE(SUM(amount), 0) AS a FROM payment_requests GROUP BY status"
+        ).fetchall():
+            out[r["status"]] = int(r["c"])
+            if r["status"] == "approved":
+                out["approved_amount"] = int(r["a"])
+    return out
+
+
+def get_reviewer_stats(admin_id: int) -> Dict[str, int]:
+    """تعداد رسیدهای تأیید/رد شده توسط یک ادمین."""
+    admin_id = validate_telegram_id(admin_id)
+    out = {"approved": 0, "rejected": 0}
+    with get_connection() as conn:
+        for r in conn.execute(
+            "SELECT status, COUNT(*) AS c FROM payment_requests WHERE reviewed_by = ? GROUP BY status", (admin_id,)
+        ).fetchall():
+            if r["status"] in out:
+                out[r["status"]] = int(r["c"])
+    return out
+
+
+# ------------------------- سرویس‌ها -------------------------
+
+def get_subscription_by_config_name(config_name: str) -> Optional[Dict[str, Any]]:
+    config_name = sanitize_text(config_name, 100)
+    if not config_name:
+        return None
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM subscriptions WHERE config_name = ? COLLATE NOCASE", (config_name,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def update_subscription_days(subscription_id: int, days: int) -> bool:
+    """days=0 یعنی بدون محدودیت زمانی."""
+    days = int(days)
+    if days < 0 or days > 3650:
+        return False
+    with get_connection() as conn:
+        return conn.execute(
+            "UPDATE subscriptions SET days = ?, updated_at = ? WHERE id = ?",
+            (days, now_ts(), subscription_id)
+        ).rowcount > 0
+
+
+# ------------------------- کد تخفیف -------------------------
+
+def get_discount_codes(limit: int = 10) -> List[Dict[str, Any]]:
+    limit = max(1, min(int(limit), 200))
+    with get_connection() as conn:
+        rows = conn.execute("SELECT * FROM discount_codes ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def set_discount_active(code_id: int, active: bool) -> bool:
+    with get_connection() as conn:
+        return conn.execute(
+            "UPDATE discount_codes SET is_active = ? WHERE id = ?", (1 if active else 0, code_id)
+        ).rowcount > 0
+
+
+def delete_discount_code(code_id: int) -> bool:
+    with get_connection() as conn:
+        return conn.execute("DELETE FROM discount_codes WHERE id = ?", (code_id,)).rowcount > 0
+
+
+# ------------------------- محصولات -------------------------
+
+def get_product(product_id: int) -> Optional[Dict[str, Any]]:
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def update_product_prices(product_id: int, price_toman: Optional[int] = None, price_stars: Optional[int] = None) -> bool:
+    sets, params = [], []
+    if price_toman is not None:
+        if int(price_toman) < 0:
+            return False
+        sets.append("price_toman = ?")
+        params.append(int(price_toman))
+    if price_stars is not None:
+        if int(price_stars) < 0:
+            return False
+        sets.append("price_stars = ?")
+        params.append(int(price_stars))
+    if not sets:
+        return False
+    params.append(product_id)
+    with get_connection() as conn:
+        return conn.execute(f"UPDATE products SET {', '.join(sets)} WHERE id = ?", params).rowcount > 0
+
+
+def set_product_active(product_id: int, active: bool) -> bool:
+    with get_connection() as conn:
+        return conn.execute(
+            "UPDATE products SET is_active = ? WHERE id = ?", (1 if active else 0, product_id)
+        ).rowcount > 0
+
+
+def delete_product(product_id: int) -> bool:
+    with get_connection() as conn:
+        return conn.execute("DELETE FROM products WHERE id = ?", (product_id,)).rowcount > 0
+
+
+# ------------------------- آمار -------------------------
+
+def get_top_services(limit: int = 3) -> List[Dict[str, Any]]:
+    limit = max(1, min(int(limit), 20))
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT kind, volume_gb, COUNT(*) AS c FROM subscriptions WHERE is_trial = 0 "
+            "GROUP BY kind, volume_gb ORDER BY c DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_recent_logs(limit: int = 20, level: Optional[str] = None) -> List[Dict[str, Any]]:
+    limit = max(1, min(int(limit), 200))
+    with get_connection() as conn:
+        if level:
+            rows = conn.execute(
+                "SELECT * FROM logs WHERE level = ? ORDER BY id DESC LIMIT ?", (level, limit)
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM logs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+
+# ------------------------- بک‌آپ و سلامت -------------------------
+
+def backup_database(dest_path) -> str:
+    """
+    بک‌آپ سازگار با WAL با API رسمی SQLite
+    (کپی ساده فایل در حالت WAL ممکن است ناقص باشد).
+    """
+    dest_path = str(dest_path)
+    src = get_connection()
+    dst = sqlite3.connect(dest_path)
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+    try:
+        os.chmod(dest_path, 0o600)
+    except Exception:
+        pass
+    return dest_path
+
+
+def check_integrity() -> bool:
+    with get_connection() as conn:
+        row = conn.execute("PRAGMA integrity_check").fetchone()
+        return bool(row) and str(row[0]).lower() == "ok"
