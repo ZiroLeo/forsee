@@ -1,92 +1,120 @@
 import logging
+
 from aiogram import Router, F
-from aiogram.types import CallbackQuery
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup
 
 from config import ADMIN_ID
-from database import get_connection, get_user_level, log_event
-from rich import build_rich_message, premium_emoji, build_button_row, build_button
-from utils import rate_limiter
+from database import (
+    list_users_page, get_user_level, get_user_registration_date,
+    is_banned, ban_user, unban_user, log_admin_action, log_event,
+)
+
+from .admin_ui import (
+    btn, page, toast, em, esc, money, LINE, protect, BLUE, GREEN, RED,
+)
 
 logger = logging.getLogger(__name__)
 router = Router(name="admin_users_list")
+protect(router)
 
 PAGE_SIZE = 5
+LEVEL_ICON = {"new": "🌱", "prime": "🥈", "royal": "👑", "diamond": "💎", "legendary": "🏆"}
 
 
-def _fetch_users_page(page: int):
-    """دریافت یک صفحه از کاربران (۵ تایی) به همراه تعداد کانفیگ."""
-    offset = (page - 1) * PAGE_SIZE
-    with get_connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT 
-                u.telegram_id, u.username, u.first_name, u.balance, u.total_purchases,
-                (SELECT COUNT(*) FROM subscriptions s WHERE s.telegram_id = u.telegram_id) AS sub_count
-            FROM users u
-            ORDER BY u.total_purchases DESC, u.telegram_id ASC
-            LIMIT ? OFFSET ?
-            """,
-            (PAGE_SIZE, offset)
-        ).fetchall()
-        users = [dict(r) for r in rows]
-        total = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
-    return users, int(total)
+def _total_pages(total: int) -> int:
+    return max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
 
 
-@router.callback_query(F.data.startswith("admin:users_list:page:"))
-async def show_users_page(callback: CallbackQuery):
-    user = callback.from_user
-    if not user or user.id != ADMIN_ID:
-        log_event("SECURITY", "unauthorized_users_list", user.id if user else 0)
-        await callback.answer("دسترسی غیرمجاز.", show_alert=True)
-        return
+def _render(page_no: int):
+    users, total = list_users_page(page_no, PAGE_SIZE)
+    pages = _total_pages(total)
 
-    page = int(callback.data.split(":")[3])
-    if page < 1:
-        page = 1
-    users, total = _fetch_users_page(page)
+    # اگر صفحه خارج از محدوده شد، به آخرین صفحه برگرد
+    if not users and page_no > 1:
+        return _render(pages)
+
+    lines = [f"{em('blue_heart', '📋')} <b>لیست کاربران</b> — صفحه {page_no} از {pages}  ({total} کاربر)", LINE]
+    rows = []
 
     if not users:
-        await callback.answer("لیست خالی است.", show_alert=True)
-        return
+        lines.append("هنوز کاربری ثبت نشده است.")
 
-    lines = [f"{premium_emoji('light', '📋')} **لیست کاربران (صفحه {page}):**\n"]
     for u in users:
-        level_key, level_name = get_user_level(u.get("total_purchases", 0))
-        name = u.get("first_name") or u.get("username") or "نامشخص"
+        tid = u["telegram_id"]
+        banned = is_banned(tid)
+        level_key, level_name = get_user_level(int(u.get("total_purchases") or 0))
+        username = f"@{esc(u['username'])}" if u.get("username") else "بدون یوزرنیم"
+        name = esc(u.get("first_name") or "—")
+        status = f"{em('false', '🚫')} مسدود" if banned else f"{em('true', '✅')} فعال"
         lines.append(
-            f"• `{u['telegram_id']}` | {name}\n"
-            f"   💰 {u['balance']:,} تومان | 📦 {u['sub_count']} سرویس | 🏆 {level_name}"
+            f"👤 <code>{tid}</code> | {username} | {name}\n"
+            f"     📅 عضویت: {get_user_registration_date(tid)}\n"
+            f"     📦 سرویس: <b>{u['sub_count']}</b> | 🛒 خرید: <b>{int(u.get('total_purchases') or 0)}</b> | "
+            f"{LEVEL_ICON.get(level_key, '⭐')} {esc(level_name)}\n"
+            f"     💰 {money(u.get('balance') or 0)} تومان | {status}"
         )
+        lines.append(LINE)
 
-    text = "\n".join(lines)
-    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+        ban_button = (
+            btn("رفع مسدودی", f"admin:users_list:unban:{tid}:{page_no}", style=GREEN, emoji="true")
+            if banned
+            else btn("مسدود کردن", f"admin:users_list:ban:{tid}:{page_no}", style=RED, emoji="false")
+        )
+        rows.append([btn(f"پروفایل {tid}", f"admin:users:view:{tid}", style=BLUE, emoji="telegram"), ban_button])
 
-    nav_row = []
-    if page > 1:
-        nav_row.append(build_button("◀️ قبلی", callback_data=f"admin:users_list:page:{page-1}", style="primary"))
-    if page < total_pages:
-        nav_row.append(build_button("بعدی ▶️", callback_data=f"admin:users_list:page:{page+1}", style="primary"))
+    nav = []
+    if page_no > 1:
+        nav.append(btn("◀️ قبلی", f"admin:users_list:page:{page_no - 1}", style=BLUE))
+    if page_no < pages:
+        nav.append(btn("بعدی ▶️", f"admin:users_list:page:{page_no + 1}", style=GREEN))
+    if nav:
+        rows.append(nav)
+    rows.append([btn("بازگشت", "admin:main", style=RED, emoji="back")])
 
-    rows = []
-    if nav_row:
-        rows.append(build_button_row(nav_row))
-    rows.append(build_button_row([
-        build_button("بازگشت", callback_data="admin:main", style="danger", premium_emoji_key="back")
-    ]))
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
+
+def _page_from(data: str, index: int) -> int:
     try:
-        await callback.message.edit_text(rich_message=build_rich_message(text, rows))
-    except Exception as e:
-        logger.exception(f"Failed to show users page: {e}")
-    await callback.answer()
+        return max(1, int(data.split(":")[index]))
+    except (IndexError, ValueError):
+        return 1
 
 
 @router.callback_query(F.data == "admin:users_list:menu")
 async def users_list_menu(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("دسترسی غیرمجاز.", show_alert=True)
+    text, markup = _render(1)
+    await page(callback, text, markup)
+
+
+@router.callback_query(F.data.startswith("admin:users_list:page:"))
+async def users_list_page(callback: CallbackQuery):
+    text, markup = _render(_page_from(callback.data, 3))
+    await page(callback, text, markup)
+
+
+@router.callback_query(F.data.startswith("admin:users_list:ban:"))
+async def users_list_ban(callback: CallbackQuery):
+    parts = callback.data.split(":")
+    target, page_no = int(parts[3]), _page_from(callback.data, 4)
+    if target == ADMIN_ID:
+        await toast(callback, "مسدود کردن ادمین اصلی ممکن نیست.", True)
         return
-    # نمایش صفحه اول
-    callback.data = "admin:users_list:page:1"
-    await show_users_page(callback)
+    ban_user(target, callback.from_user.id, "مسدود توسط ادمین")
+    log_admin_action(callback.from_user.id, "user_ban", str(target), "from users_list")
+    log_event("INFO", "admin_user_banned", callback.from_user.id, f"target={target}")
+    await toast(callback, "کاربر مسدود شد.")
+    text, markup = _render(page_no)
+    await page(callback, text, markup, answer=False)
+
+
+@router.callback_query(F.data.startswith("admin:users_list:unban:"))
+async def users_list_unban(callback: CallbackQuery):
+    parts = callback.data.split(":")
+    target, page_no = int(parts[3]), _page_from(callback.data, 4)
+    unban_user(target, callback.from_user.id)
+    log_admin_action(callback.from_user.id, "user_unban", str(target), "from users_list")
+    log_event("INFO", "admin_user_unbanned", callback.from_user.id, f"target={target}")
+    await toast(callback, "مسدودی برداشته شد.")
+    text, markup = _render(page_no)
+    await page(callback, text, markup, answer=False)
