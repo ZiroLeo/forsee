@@ -302,7 +302,7 @@ def prices_menu_keyboard() -> InlineKeyboardMarkup:
             make_button(
                 "هر گیگ بدون زمان",
                 "admin:prices:edit:no_expiry_gb",
-                "primary",
+                "success",
                 "safe",
             ),
         ],
@@ -310,7 +310,7 @@ def prices_menu_keyboard() -> InlineKeyboardMarkup:
             make_button(
                 "یوزر اضافه حجمی",
                 "admin:prices:edit:vol_device",
-                "primary",
+                "danger",
                 "telegram",
             ),
             make_button(
@@ -324,13 +324,13 @@ def prices_menu_keyboard() -> InlineKeyboardMarkup:
             make_button(
                 "ماه اضافه حجمی",
                 "admin:prices:edit:vol_month",
-                "primary",
+                "success",
                 "light",
             ),
             make_button(
                 "ماه اضافه نامحدود",
                 "admin:prices:edit:unl_month",
-                "primary",
+                "danger",
                 "diamond",
             ),
         ],
@@ -525,6 +525,8 @@ async def ask_new_price(
     await state.update_data(
         price_item=item_key,
         price_currency=currency,
+        panel_chat=callback.message.chat.id if callback.message else None,
+        panel_msg=callback.message.message_id if callback.message else None,
     )
 
     await state.set_state(PriceStates.waiting_value)
@@ -695,27 +697,48 @@ async def receive_new_price(
         f"Stars: {format_number(stars)}"
     )
 
-    await message.answer(
-        success_text,
-        reply_markup=keyboard([
-            [
-                make_button(
-                    "مدیریت سایر قیمت‌ها",
-                    "admin:prices:menu",
-                    "primary",
-                    "shop",
-                ),
-            ],
-            [
-                make_button(
-                    "بازگشت به پنل",
-                    "admin:main",
-                    "danger",
-                    "back",
-                ),
-            ],
-        ]),
-    )
+    success_markup = keyboard([
+        [
+            make_button(
+                "مدیریت سایر قیمت‌ها",
+                "admin:prices:menu",
+                "success",
+                "shop",
+            ),
+            make_button(
+                "بازگشت به پنل",
+                "admin:main",
+                "danger",
+                "back",
+            ),
+        ],
+    ])
+
+    # همان پیام پنل ویرایش می‌شود (پیام عددِ ادمین پاک می‌شود)؛
+    # اگر نشد، پیام جدید ارسال می‌شود.
+    panel_chat = data.get("panel_chat")
+    panel_msg = data.get("panel_msg")
+    edited = False
+
+    if panel_chat and panel_msg:
+        try:
+            await message.bot.edit_message_text(
+                chat_id=panel_chat,
+                message_id=panel_msg,
+                text=success_text,
+                reply_markup=success_markup,
+            )
+            edited = True
+        except Exception:
+            logger.warning("Could not edit price panel message", exc_info=True)
+
+    if edited:
+        try:
+            await message.delete()
+        except Exception:
+            pass
+    else:
+        await message.answer(success_text, reply_markup=success_markup)
 
     logger.info(
         "Admin %s updated %s (%s): %s -> %s",
