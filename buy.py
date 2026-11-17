@@ -16,24 +16,27 @@ from config import (
     MAX_MONTHS, PREMIUM_EMOJIS, PREMIUM_EMOJI_ENABLED,
 )
 from database import (
-    add_balance, add_referral_commission, consume_discount_code,
-    create_subscription, deduct_balance, get_balance, get_discount_code,
-    get_setting, hard_delete_subscription, increment_total_purchases, log_event,
+    add_balance, set_setting, finalize_purchase,
+    deduct_balance, get_balance, get_discount_code,
+    get_setting, hard_delete_subscription, log_event,
+    list_products, get_product,
 )
 from paxiva import PaxivaClient, PaxivaError
 from services.counter import make_config_name, release_reserved_number, reserve_new_config_number
 from rich import premium_emoji
 import ui
+from pricing import get_price, order_price_toman, order_price_stars
 from utils import (
-    calculate_price_stars, calculate_price_toman, generate_idempotency_key,
+    generate_idempotency_key,
     rate_limiter, validate_discount_code,
 )
+
+# ✅ افزودن هشدار به دولوپر
+from dev.alerts import send_alert
 
 logger = logging.getLogger(__name__)
 router = Router(name="buy")
 
-VOLUME_OPTIONS = {"10": 10, "20": 20, "30": 30, "50": 50, "100": 100, "200": 200, "500": 500}
-UNLIMITED_OPTIONS = {"unl150": 150, "unl_inf": 0}
 SERVICE_VOLUME = "vol"
 SERVICE_UNLIMITED = "unl"
 MAX_DEVICES = 10
@@ -57,8 +60,6 @@ def _pending_setting_key(user_id: int) -> str:
 
 
 def _persist_pending_purchase(user_id: int, order_key: str, status: str) -> None:
-    # از جدول settings موجود استفاده می‌کنیم تا در صورت restart هم
-    # سفارش مبهم باعث خرید یا کسر وجه تکراری نشود؛ نیازی به تغییر DB نیست.
     payload = {"order_key": order_key, "status": status}
     set_setting(_pending_setting_key(user_id), json.dumps(payload, ensure_ascii=False))
 
@@ -87,16 +88,23 @@ def _emoji_id(key: Optional[str]) -> Optional[str]:
 
 
 def _button(text: str, callback_data: str, emoji_key: Optional[str] = None) -> InlineKeyboardButton:
-    if not text or not callback_data:
-        raise ValueError("Button text and callback_data are required")
+    if not callback_data:
+        raise ValueError("callback_data is required")
     if len(callback_data.encode("utf-8")) > 64:
         raise ValueError("Callback data exceeds Telegram's 64-byte limit")
-    kwargs: dict[str, Any] = {"text": text, "callback_data": callback_data, "style": "primary"}
+
     emoji_id = _emoji_id(emoji_key)
+    if not text and not emoji_id:
+        raise ValueError("Button must have text or emoji")
+
+    kwargs: dict[str, Any] = {
+        "text": text if text else "\u200b",  # کاراکتر نامرئی برای متن خالی
+        "callback_data": callback_data,
+        "style": "primary",
+    }
     if emoji_id:
         kwargs["icon_custom_emoji_id"] = emoji_id
     return InlineKeyboardButton(**kwargs)
-
 
 def _keyboard(rows: list[list[InlineKeyboardButton]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -118,7 +126,48 @@ def _valid_config_uri(value: Any) -> bool:
     }
 
 
-# message_id همان پیامی که صفحه‌ی خرید در آن نمایش داده می‌شود در state ذخیره و ویرایش می‌شود.
+# ============================================================
+# PRODUCTS FROM DATABASE
+# ============================================================
+
+def _get_products_by_kind(kind: str) -> list[dict]:
+    """دریافت محصولات فعال از دیتابیس بر اساس نوع."""
+    try:
+        return [p for p in list_products(active_only=True) if p["kind"] == kind]
+    except Exception:
+        logger.exception("Could not load products from database")
+        return []
+
+
+def _product_to_key(product: dict) -> str:
+    """تبدیل محصول به کلید یکتا برای callback_data."""
+    return str(product["id"])
+
+
+def _product_from_key(key: str) -> Optional[dict]:
+    """یافتن محصول از کلید (id) در دیتابیس."""
+    try:
+        product_id = int(key)
+        product = get_product(product_id)
+        if product and product.get("is_active"):
+            return product
+    except (ValueError, TypeError):
+        pass
+    return None
+
+
+def _valid_product_for_service(product: dict, service_type: str) -> bool:
+    if service_type == SERVICE_VOLUME:
+        return product["kind"] == "vol"
+    if service_type == SERVICE_UNLIMITED:
+        return product["kind"] == "unl"
+    return False
+
+
+# ============================================================
+# MESSAGE EDIT
+# ============================================================
+
 async def _edit_purchase(
     *, bot, state: FSMContext, text: str,
     reply_markup: Optional[InlineKeyboardMarkup] = None,
@@ -175,7 +224,9 @@ async def _edit_user_message(message: Message, state: FSMContext, text: str, mar
     return await _edit_purchase(bot=message.bot, state=state, text=text, reply_markup=markup)
 
 
-# ----------------------------- Keyboards -----------------------------
+# ============================================================
+# KEYBOARDS
+# ============================================================
 
 def buy_type_selection_keyboard() -> InlineKeyboardMarkup:
     return _keyboard([
@@ -185,38 +236,49 @@ def buy_type_selection_keyboard() -> InlineKeyboardMarkup:
 
 
 def buy_volume_selection_keyboard(service_type: str) -> InlineKeyboardMarkup:
+    products = _get_products_by_kind(service_type)
     rows: list[list[InlineKeyboardButton]] = []
-    if service_type == SERVICE_VOLUME:
-        opts = [("۱۰ گیگ", "10"), ("۲۰ گیگ", "20"), ("۳۰ گیگ", "30"), ("۵۰ گیگ", "50"),
-                ("۱۰۰ گیگ", "100"), ("۲۰۰ گیگ", "200"), ("۵۰۰ گیگ", "500")]
-        for i in range(0, len(opts), 2):
-            rows.append([_button(label, f"buy:vol:{key}", "blue_dot") for label, key in opts[i:i + 2]])
-    elif service_type == SERVICE_UNLIMITED:
-        rows.extend([
-            [_button("نامحدود منصفانه (۱۵۰ گیگ)", "buy:vol:unl150", "world")],
-            [_button("نامحدود بی‌نهایت", "buy:vol:unl_inf", "diamond")],
-        ])
+
+    if not products:
+        rows.append([_button("محصولی موجود نیست", "buy:noop", "warning")])
     else:
-        raise ValueError("Invalid service type")
-    rows.append([_button("بازگشت", "buy:main", "shop")])
+        # دو دکمه در هر ردیف برای خوانایی بهتر
+        for i in range(0, len(products), 2):
+            row = []
+            for p in products[i:i + 2]:
+                label = (
+                    f"{p['volume_gb']:g} گیگ"
+                    if p["kind"] == "vol" and p["volume_gb"] > 0
+                    else ("نامحدود ۱۵۰ گیگ" if p["volume_gb"] > 0 else "نامحدود بی‌نهایت")
+                    if p["kind"] == "unl"
+                    else f"{p['volume_gb']:g} گیگ"
+                )
+                row.append(_button(label, f"buy:prod:{p['id']}", "blue_dot" if p["kind"] == "vol" else "diamond"))
+            rows.append(row)
+
+    rows.append([_button("بازگشت", "buy:main", "back")])
     return _keyboard(rows)
 
 
-def buy_time_selection_keyboard(months: int) -> InlineKeyboardMarkup:
-    return _keyboard([
-        [_button("−", "buy:time:dec", "blue_dot"), _button(f"{months} ماه", "buy:time:noop", "light"),
-         _button("+", "buy:time:inc", "blue_dot")],
-        [_button("تأیید و ادامه", "buy:time:confirm", "true")],
-        [_button("بازگشت", "buy:vol", "shop")],
-    ])
+def buy_time_selection_keyboard(months: int, show_nolimit: bool = False, nolimit_active: bool = False) -> InlineKeyboardMarkup:
+    rows = [
+        [_button("", "buy:time:dec", "minus"), _button(f"{months} ماه", "buy:time:noop", "light"),
+         _button("", "buy:time:inc", "plus")],
+    ]
+    if show_nolimit:
+        label = "✅ بدون محدودیت زمانی" if nolimit_active else "بدون محدودیت زمانی"
+        rows.append([_button(label, "buy:time:nolimit", "diamond")])
+    rows.append([_button("تأیید و ادامه", "buy:time:confirm", "true")])
+    rows.append([_button("بازگشت", "buy:vol", "back")])
+    return _keyboard(rows)
 
 
 def buy_device_selection_keyboard(devices: int) -> InlineKeyboardMarkup:
     return _keyboard([
-        [_button("−", "buy:dev:dec", "blue_dot"), _button(f"{devices} دستگاه", "buy:dev:noop", "telegram"),
-         _button("+", "buy:dev:inc", "blue_dot")],
+        [_button("", "buy:dev:dec", "minus"), _button(f"{devices} دستگاه", "buy:dev:noop", "telegram"),
+         _button("", "buy:dev:inc", "plus")],
         [_button("تأیید و ادامه", "buy:dev:confirm", "true")],
-        [_button("بازگشت", "buy:time", "shop")],
+        [_button("بازگشت", "buy:time", "back")],
     ])
 
 
@@ -224,50 +286,57 @@ def buy_discount_keyboard() -> InlineKeyboardMarkup:
     return _keyboard([
         [_button("وارد کردن کد تخفیف", "buy:discount:enter", "gift")],
         [_button("بدون کد تخفیف ادامه می‌دهم", "buy:discount:skip", "true")],
-        [_button("بازگشت", "buy:dev", "shop")],
+        [_button("بازگشت", "buy:dev", "back")],
     ])
 
 
-def buy_payment_keyboard(price: int) -> InlineKeyboardMarkup:
+def buy_payment_keyboard(price_toman: int, price_stars: int) -> InlineKeyboardMarkup:
     return _keyboard([
-        [_button(f"پرداخت با کیف پول | {price:,} تومان", "buy:pay:wallet", "wallet")],
-        [_button("بازگشت", "buy:discount", "shop")],
+        [_button(f"پرداخت با کیف پول | {price_toman:,} تومان", "buy:pay:wallet", "wallet")],
+        [_button(f"پرداخت با Stars | {price_stars} ", "buy:pay:stars", "stars")],
+        [_button("بازگشت", "buy:discount", "back")],
     ])
 
 
 def purchase_success_keyboard(client_id: int) -> InlineKeyboardMarkup:
     return _keyboard([
         [_button("دریافت کامل کانفیگ‌ها", f"buy:configs:{client_id}", "world")],
-        [_button("بازگشت به منوی اصلی", "menu:main", "telegram")],
+        [_button("بازگشت به منوی اصلی", "menu:main", "back")],
     ])
 
 
-def purchase_retry_keyboard(price: int) -> InlineKeyboardMarkup:
+def purchase_retry_keyboard(price_toman: int) -> InlineKeyboardMarkup:
     return _keyboard([
-        [_button(f"تلاش دوباره برای پرداخت | {price:,} تومان", "buy:pay:wallet", "wallet")],
-        [_button("بازگشت به فاکتور", "buy:discount", "shop")],
+        [_button(f"تلاش دوباره برای پرداخت | {price_toman:,} تومان", "buy:pay:wallet", "wallet")],
+        [_button("بازگشت به فاکتور", "buy:discount", "back")],
     ])
 
 
-# ----------------------------- Pricing -----------------------------
+# ============================================================
+# PRICING
+# ============================================================
 
 def _valid_purchase_data(data: dict[str, Any]) -> bool:
     try:
-        volume, days, devices = float(data["volume_gb"]), int(data["days"]), int(data["devices"])
-        key, service_type = str(data["volume_key"]), str(data["service_type"])
+        volume = float(data["volume_gb"])
+        days = int(data["days"])
+        devices = int(data["devices"])
+        product_id = int(data["product_id"])
+        service_type = str(data["service_type"])
     except (KeyError, TypeError, ValueError):
         return False
     if not 1 <= devices <= MAX_DEVICES:
         return False
-    if service_type == SERVICE_VOLUME:
-        return key in VOLUME_OPTIONS and volume == VOLUME_OPTIONS[key] and 30 <= days <= MAX_MONTHS * 30 and days % 30 == 0
-    if service_type == SERVICE_UNLIMITED:
-        if key not in UNLIMITED_OPTIONS or volume != UNLIMITED_OPTIONS[key]:
-            return False
-        if key == "unl_inf":
-            return days == 0
-        return key == "unl150" and 30 <= days <= MAX_MONTHS * 30 and days % 30 == 0
-    return False
+    product = get_product(product_id)
+    if not product or not product.get("is_active"):
+        return False
+    if product["kind"] != ("vol" if service_type == SERVICE_VOLUME else "unl"):
+        return False
+    if float(product["volume_gb"]) != volume:
+        return False
+    if days == 0:
+        return True
+    return 30 <= days <= MAX_MONTHS * 30 and days % 30 == 0
 
 
 def _discount_for_order(data: dict[str, Any]) -> tuple[int, Optional[int]]:
@@ -286,28 +355,40 @@ def _discount_for_order(data: dict[str, Any]) -> tuple[int, Optional[int]]:
         return 0, None
 
 
-def _calculate_prices(volume: float, days: int, devices: int, key: str) -> tuple[int, int]:
-    if key in {"unl_inf", "unl150"}:
-        toman_key = "unlimited_inf" if key == "unl_inf" else "unlimited_150"
-        stars_key = toman_key
-        toman_base = int(DEFAULT_PRICES_TOMAN.get(toman_key, 0))
-        stars_base = int(DEFAULT_PRICES_STARS.get(stars_key, 0))
-        if toman_base <= 0 or stars_base < 0:
-            raise ValueError("Unlimited price is not configured")
-        return (
-            calculate_price_toman(volume, days, devices, is_unlimited=True, unlimited_price=toman_base),
-            calculate_price_stars(volume, days, devices, is_unlimited=True, unlimited_stars=stars_base),
-        )
-    return (
-        calculate_price_toman(volume, days, devices, is_unlimited=False),
-        calculate_price_stars(volume, days, devices, is_unlimited=False),
-    )
+def _price_with_product_base(product: dict, key: str, volume: float, days: int, devices: int, currency: str) -> int:
+    """PRICE-01: قیمتِ ذخیره‌شده در محصول (که ادمین دستی تعیین کرده) مبنای قیمت است.
+    اضافه‌ها (ماه/دستگاه/بدون‌محدودیت) به‌صورت «اختلاف فرمول سفارش با فرمول پیکربندی پایهٔ محصول»
+    از روی تنظیمات قیمت اضافه می‌شود. اگر قیمت محصول صفر/نامعتبر بود، همان فرمول تنظیمات استفاده می‌شود."""
+    calc = order_price_toman if currency == "toman" else order_price_stars
+    formula = calc(key, volume, days, devices)
+    try:
+        stored = int(product.get("price_toman" if currency == "toman" else "price_stars") or 0)
+        base_days = int(product.get("days") or 0)
+    except (TypeError, ValueError):
+        return formula
+    if stored <= 0:
+        return formula
+    base_formula = calc(key, volume, base_days, MAX_DEVICES_DEFAULT)
+    return max(0, stored + (formula - base_formula))
 
 
 def _build_order_prices(data: dict[str, Any]) -> tuple[int, int, int, Optional[int]]:
     if not _valid_purchase_data(data):
         raise ValueError("Invalid purchase data")
-    toman, stars = _calculate_prices(float(data["volume_gb"]), int(data["days"]), int(data["devices"]), str(data["volume_key"]))
+    volume = float(data["volume_gb"])
+    days = int(data["days"])
+    devices = int(data["devices"])
+    product_id = int(data["product_id"])
+    product = get_product(product_id)
+    if not product:
+        raise ValueError("Product not found")
+    key = "unl_inf" if product["kind"] == "unl" and volume <= 0 else (
+        "unl150" if product["kind"] == "unl" else f"vol_{int(volume)}"
+    )
+    toman = _price_with_product_base(product, key, volume, days, devices, "toman")
+    stars = _price_with_product_base(product, key, volume, days, devices, "stars")
+    if toman <= 0:
+        raise ValueError("Price is not configured")
     discount_percent, discount_id = _discount_for_order(data)
     toman = toman * (100 - discount_percent) // 100
     stars = stars * (100 - discount_percent) // 100
@@ -317,15 +398,19 @@ def _build_order_prices(data: dict[str, Any]) -> tuple[int, int, int, Optional[i
 
 
 def _service_title(data: dict[str, Any]) -> str:
-    key = data.get("volume_key")
-    if key == "unl150":
-        return "نامحدود منصفانه با سقف ۱۵۰ گیگ"
-    if key == "unl_inf":
-        return "نامحدود بی‌نهایت"
-    return f"{int(float(data.get('volume_gb', 0)))} گیگ حجمی"
+    product_id = data.get("product_id")
+    product = get_product(int(product_id)) if product_id else None
+    if not product:
+        return "سرویس نامشخص"
+    if product["kind"] == "unl":
+        return "نامحدود بی‌نهایت" if product["volume_gb"] <= 0 else f"نامحدود {product['volume_gb']:g} گیگ"
+    return f"{product['volume_gb']:g} گیگ حجمی"
 
 
-# ----------------------------- Render steps -----------------------------
+# ============================================================
+# RENDER STEPS
+# ============================================================
+
 async def _show_volume_step(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     title = "حجمی" if data.get("service_type") == SERVICE_VOLUME else "نامحدود"
@@ -337,18 +422,26 @@ async def _show_volume_step(callback: CallbackQuery, state: FSMContext) -> None:
 async def _show_time_step(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     months = max(1, min(MAX_MONTHS, int(data.get("months", 1))))
-    text = (f"{premium_emoji('light', '●')} <b>انتخاب مدت سرویس</b>\n\n"
+    unl = data.get("service_type") == SERVICE_UNLIMITED
+    month_price = get_price("unl_month" if unl else "vol_month", "toman")
+    nolimit = (not unl) and int(data.get("days", 30)) == 0
+    duration = "بدون محدودیت زمانی" if nolimit else f"{months} ماه"
+    extra = ""
+    if not unl:
+        extra = f"قیمت هر گیگ بدون محدودیت زمانی: <b>{get_price('no_expiry_gb', 'toman'):,} تومان</b>\n"
+    text = (f"{premium_emoji('light', '⭐')} <b>انتخاب مدت سرویس</b>\n\n"
             f"سرویس انتخابی: <b>{_safe_text(_service_title(data))}</b>\n"
-            f"مدت فعلی: <b>{months} ماه</b>\n"
-            f"هزینه هر ماه اضافه: <b>{int(DEFAULT_PRICES_TOMAN.get('per_month', 30000)):,} تومان</b>\n\n"
+            f"مدت فعلی: <b>{duration}</b>\n"
+            f"هزینه هر ماه اضافه: <b>{month_price:,} تومان</b>\n{extra}\n"
             "مدت موردنظرت را انتخاب کن.")
-    await _edit_callback(callback, state, text, buy_time_selection_keyboard(months))
+    await _edit_callback(callback, state, text, buy_time_selection_keyboard(months, show_nolimit=not unl, nolimit_active=nolimit))
 
 
 async def _show_device_step(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     devices = max(1, min(MAX_DEVICES, int(data.get("devices", MAX_DEVICES_DEFAULT))))
-    extra = max(0, devices - MAX_DEVICES_DEFAULT) * int(DEFAULT_PRICES_TOMAN.get("per_device", 15000))
+    unit_dev = get_price("unl_device" if data.get("service_type") == SERVICE_UNLIMITED else "vol_device", "toman")
+    extra = max(0, devices - MAX_DEVICES_DEFAULT) * unit_dev
     text = (f"{premium_emoji('telegram', '●')} <b>تعداد دستگاه‌های مجاز</b>\n\n"
             f"سرویس: <b>{_safe_text(_service_title(data))}</b>\n"
             f"تعداد دستگاه: <b>{devices}</b>\n"
@@ -376,38 +469,69 @@ async def _show_invoice(*, bot, state: FSMContext, source_message: Optional[Mess
             reply_markup=buy_type_selection_keyboard(), source_message=source_message)
         return
     try:
-        price, _stars, discount, _discount_id = _build_order_prices(data)
+        price_toman, price_stars, discount, _discount_id = _build_order_prices(data)
     except Exception:
         logger.exception("Could not calculate purchase invoice")
+        send_alert("ERROR", f"محاسبه قیمت ناموفق\nuser_id: {data.get('user_id')}\nproduct_id: {data.get('product_id')}")
         await _edit_purchase(bot=bot, state=state,
             text=f"{premium_emoji('warning', '●')} <b>محاسبه قیمت ناموفق بود.</b> با پشتیبانی تماس بگیر.",
             reply_markup=buy_discount_keyboard(), source_message=source_message)
         return
+
+    # ذخیره قیمت Stars در state برای استفاده در stars.py
+    await state.update_data(price_toman=price_toman, price_stars=price_stars)
+
     try:
         balance = get_balance(int(data["user_id"]))
     except Exception:
         logger.exception("Could not read balance")
         balance = 0
-    discount_line = f"<b>تخفیف:</b> {discount}%\n" if discount else ""
+
+    discount_line = (
+        f"{premium_emoji('gift', '🏷')} <b>تخفیف:</b> {discount}%\n"
+        if discount else ""
+    )
     days = int(data["days"])
     duration = "بدون انقضا" if days == 0 else f"{days // 30} ماه"
-    text = (f"{premium_emoji('wallet', '●')} <b>فاکتور نهایی خرید</b>\n\n"
-            f"<b>نوع سرویس:</b> {_safe_text(_service_title(data))}\n"
-            f"<b>مدت:</b> {duration}\n"
-            f"<b>دستگاه‌ها:</b> {int(data['devices'])}\n{discount_line}"
-            "━━━━━━━━━━━━━━\n"
-            f"<b>مبلغ قابل پرداخت:</b> <b>{price:,} تومان</b>\n"
-            f"<b>موجودی کیف پول:</b> {int(balance):,} تومان\n\n"
-            "برای نهایی‌کردن سفارش، پرداخت از کیف پول را انتخاب کن.")
-    await _edit_purchase(bot=bot, state=state, text=text,
-        reply_markup=buy_payment_keyboard(price), source_message=source_message)
+
+    text = (
+        f"{premium_emoji('blue_fire', '💰')} <b>فاکتور نهایی خرید</b>\n"
+        "━━━━━━━━━━━━━━\n\n"
+
+        f"{premium_emoji('shop', '🛒')} <b>نوع سرویس:</b> {_safe_text(_service_title(data))}\n"
+        f"{premium_emoji('light', '📅')} <b>مدت:</b> {duration}\n"
+        f"{premium_emoji('telegram', '👥')} <b>دستگاه‌ها:</b> {int(data['devices'])}\n"
+        f"{discount_line}\n"
+
+        "━━━━━━━━━━━━━━\n"
+        f"{premium_emoji('blue_heart', '💵')} <b>مبلغ تومانی:</b> <b>{price_toman:,} تومان</b>\n"
+        f"{premium_emoji('stars', '⭐')} <b>مبلغ Stars:</b> <b>{price_stars}</b>\n"
+        f"{premium_emoji('diamond', '💎')} <b>موجودی کیف پول:</b> {int(balance):,} تومان\n\n"
+
+        "روش پرداخت را انتخاب کن."
+    )
+
+    await _edit_purchase(
+        bot=bot, state=state, text=text,
+        reply_markup=buy_payment_keyboard(price_toman, price_stars),
+        source_message=source_message,
+    )
 
 
-# ----------------------------- PAXIVA + wallet -----------------------------
+# ============================================================
+# PAXIVA + WALLET
+# ============================================================
+
 async def _delete_remote(paxiva: PaxivaClient, client_id: int) -> bool:
+    """PAX-02: حذف نرم (بدون purge) تا در صورت خطا قابل بازیابی از سطل بازیافت پنل باشد."""
     try:
-        await paxiva.delete_client(client_id, purge=True)
+        await paxiva.delete_client(client_id, purge=False)
         return True
+    except PaxivaError as exc:
+        if getattr(exc, "status_code", None) == 404:
+            return True  # قبلاً حذف شده
+        logger.exception("Could not delete remote client %s", client_id)
+        return False
     except Exception:
         logger.exception("Could not delete remote client %s", client_id)
         return False
@@ -427,7 +551,7 @@ async def _provision_purchase(*, user_id: int, data: dict[str, Any], paxiva: Pax
     if not _valid_purchase_data(data):
         return "failed", "اطلاعات سفارش معتبر نیست."
     try:
-        price, _stars, _discount_percent, discount_id = _build_order_prices(data)
+        price_toman, _price_stars, _discount_percent, discount_id = _build_order_prices(data)
     except Exception:
         logger.exception("Final purchase price validation failed")
         return "failed", "محاسبه مبلغ سفارش ناموفق بود."
@@ -436,19 +560,27 @@ async def _provision_purchase(*, user_id: int, data: dict[str, Any], paxiva: Pax
     if not order_key:
         return "failed", "شناسه سفارش معتبر نیست. خرید را از ابتدا شروع کن."
 
-    volume, days, devices = float(data["volume_gb"]), int(data["days"]), int(data["devices"])
-    key = str(data["volume_key"])
-    kind = SERVICE_UNLIMITED if key in UNLIMITED_OPTIONS else SERVICE_VOLUME
+    product_id = int(data["product_id"])
+    product = get_product(product_id)
+    if not product:
+        return "failed", "محصول یافت نشد."
+
+    volume = float(product["volume_gb"])
+    days = int(data["days"])
+    devices = int(data["devices"])
+    kind = product["kind"]
     number = config_name = client_id = subscription_id = None
     debited = False
     create_started = False
     create_response_received = False
+    completed = False  # بعد از ثبت اتمیک اشتراک، هیچ rollbackی مجاز نیست
 
     try:
-        debited = deduct_balance(user_id, price, "purchase",
+        debited = deduct_balance(user_id, price_toman, "purchase",
             f"خرید سرویس {volume:g}GB / {days} روز", reference_id=order_key)
     except Exception:
         logger.exception("Wallet deduction failed")
+        send_alert("ERROR", f"خطای کسر کیف پول\nکاربر: {user_id}\nمبلغ: {price_toman}\norder: {order_key}")
         return "failed", "کسر موجودی انجام نشد. دوباره تلاش کن."
     if not debited:
         return "failed", "موجودی کیف پول کافی نیست یا کسر موجودی انجام نشد."
@@ -485,43 +617,48 @@ async def _provision_purchase(*, user_id: int, data: dict[str, Any], paxiva: Pax
         if not _valid_subscription_link(link):
             raise RuntimeError("PAXIVA returned invalid subscription link")
 
-        subscription_id = create_subscription(
-            telegram_id=user_id, config_number=number, config_name=config_name,
-            kind=kind, volume_gb=volume, days=days, devices=devices,
-            price_toman=price, price_stars=0, paxiva_client_id=client_id, link=str(link),
-        )
-        if not subscription_id:
-            raise RuntimeError("Could not save subscription")
-
-        if discount_id is not None and not consume_discount_code(int(discount_id), user_id):
+        try:
+            subscription_id = finalize_purchase(
+                telegram_id=user_id, config_number=number, config_name=config_name,
+                kind=kind, volume_gb=volume, days=days, devices=devices,
+                price_toman=price_toman, paxiva_client_id=client_id, link=str(link),
+                discount_id=int(discount_id) if discount_id is not None else None,
+            )
+        except ValueError:
+            send_alert("ERROR", f"مصرف کد تخفیف ناموفق\nکاربر: {user_id}\ndiscount_id: {discount_id}\norder: {order_key}")
             raise RuntimeError("Discount code became unavailable or was already used")
-
-        try:
-            increment_total_purchases(user_id)
         except Exception:
-            logger.exception("Could not increment purchase count")
-        try:
-            add_referral_commission(user_id, price, int(subscription_id), "purchase")
-        except Exception:
-            logger.exception("Referral commission failed")
+            send_alert("ERROR", f"ذخیره اشتراک در دیتابیس ناموفق\nکاربر: {user_id}\nconfig: {config_name}\norder: {order_key}")
+            raise
+        completed = True
 
         _safe_log("INFO", "purchase_success", user_id,
             f"order={order_key}; subscription={subscription_id}; client={client_id}; config={config_name}")
         return "success", {
             "config_name": config_name, "link": str(link), "client_id": client_id,
-            "subscription_id": int(subscription_id), "price_toman": price,
+            "subscription_id": int(subscription_id), "price_toman": price_toman,
         }
 
     except Exception as exc:
         logger.exception("Purchase provisioning failed for user %s", user_id)
+        if completed and subscription_id:
+            # سرویس پرداخت و ثبت شده؛ خطای بعدی نباید آن را حذف کند
+            return "success", {
+                "config_name": config_name, "link": str(link), "client_id": client_id,
+                "subscription_id": int(subscription_id), "price_toman": price_toman,
+            }
         definitive_rejection = isinstance(exc, PaxivaError) and 400 <= int(getattr(exc, "status_code", 500)) < 500
         if create_started and not create_response_received and not definitive_rejection:
             _safe_log("CRITICAL", "purchase_ambiguous", user_id, f"order={order_key}; config={config_name}; no panel response")
+            # ✅ هشدار به دولوپر
+            send_alert("ERROR", f"خرید مبهم - پنل پاسخ نداد\nکاربر: {user_id}\norder: {order_key}\nconfig: {config_name}")
             return "pending", ("ارتباط با پنل هنگام ساخت سرویس قطع شد و نتیجه قطعی نیست. ممکن است سرویس ساخته شده باشد؛ "
                                 "برای جلوگیری از خرید تکراری، بازپرداخت خودکار انجام نمی‌شود. با پشتیبانی تماس بگیر.")
 
         if client_id is not None and not await _delete_remote(paxiva, client_id):
             _safe_log("CRITICAL", "purchase_orphan_client", user_id, f"order={order_key}; client={client_id}")
+            # ✅ هشدار به دولوپر
+            send_alert("ERROR", f"حذف سرویس از پنل ناموفق\nکاربر: {user_id}\nclient: {client_id}\norder: {order_key}")
             return "pending", "سرویس در پنل ساخته شده اما حذف آن تأیید نشد؛ سفارش نیازمند بررسی پشتیبانی است."
 
         if subscription_id is not None:
@@ -535,17 +672,24 @@ async def _provision_purchase(*, user_id: int, data: dict[str, Any], paxiva: Pax
         if number is not None:
             release_reserved_number(int(number), is_test=False)
 
-        if debited and not _refund(user_id, price, order_key, f"بازگشت وجه سفارش {config_name or order_key}"):
-            _safe_log("CRITICAL", "purchase_refund_failed", user_id, f"order={order_key}; amount={price}")
+        if debited and not _refund(user_id, price_toman, order_key, f"بازگشت وجه سفارش {config_name or order_key}"):
+            _safe_log("CRITICAL", "purchase_refund_failed", user_id, f"order={order_key}; amount={price_toman}")
+            # ✅ هشدار به دولوپر
+            send_alert("ERROR", f"بازگشت وجه ناموفق\nکاربر: {user_id}\nمبلغ: {price_toman}\norder: {order_key}")
             return "pending", "خرید ناموفق بود اما بازگشت وجه تأیید نشد. فوراً با پشتیبانی تماس بگیر."
 
         _safe_log("ERROR", "purchase_failed", user_id, f"order={order_key}; error={type(exc).__name__}")
         if isinstance(exc, PaxivaError):
+            # ✅ هشدار به دولوپر
+            send_alert("ERROR", f"خطای PAXIVA در خرید\nکاربر: {user_id}\nخطا: {exc.message}\norder: {order_key}")
             return "failed", "پنل ساخت سرویس را رد کرد؛ مبلغ به کیف پولت بازگشت داده شد."
         return "failed", "ساخت سرویس کامل نشد؛ مبلغ به کیف پولت بازگشت داده شد."
 
 
-# ----------------------------- Start / service selection -----------------------------
+# ============================================================
+# START / SERVICE SELECTION
+# ============================================================
+
 @router.callback_query(F.data == "menu:buy")
 async def start_buy(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
@@ -570,7 +714,6 @@ async def start_buy(callback: CallbackQuery, state: FSMContext):
 
     await state.clear()
     text = f"{premium_emoji('shop', '●')} <b>خرید سرویس آی‌من نتورک</b>\n\nنوع سرویس موردنظرت را انتخاب کن."
-    # همان پیام اصلی به صفحه‌ی خرید ویرایش می‌شود (شناسه‌اش در state ثبت می‌شود).
     purchase_message = await ui.show(callback, text, buy_type_selection_keyboard())
     if purchase_message is None:
         return
@@ -587,7 +730,7 @@ async def select_volume_type(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     if not await _current_purchase(callback, state):
         return
-    await state.update_data(service_type=SERVICE_VOLUME, volume_gb=None, volume_key=None,
+    await state.update_data(service_type=SERVICE_VOLUME, product_id=None, volume_gb=None,
         days=None, months=1, devices=MAX_DEVICES_DEFAULT, discount_id=None,
         discount_code=None, discount_percent=0, purchase_processing=False, purchase_pending=False)
     await _edit_callback(callback, state,
@@ -600,12 +743,12 @@ async def select_unlimited_type(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     if not await _current_purchase(callback, state):
         return
-    await state.update_data(service_type=SERVICE_UNLIMITED, volume_gb=None, volume_key=None,
+    await state.update_data(service_type=SERVICE_UNLIMITED, product_id=None, volume_gb=None,
         days=None, months=1, devices=MAX_DEVICES_DEFAULT, discount_id=None,
         discount_code=None, discount_percent=0, purchase_processing=False, purchase_pending=False)
     await _edit_callback(callback, state,
         f"{premium_emoji('world', '●')} <b>انتخاب سرویس نامحدود</b>\n\n"
-        "۱. نامحدود منصفانه با سقف ۱۵۰ گیگ\n۲. نامحدود بی‌نهایت و بدون انقضا",
+        "پلن موردنظرت را انتخاب کن.",
         buy_volume_selection_keyboard(SERVICE_UNLIMITED))
 
 
@@ -614,33 +757,39 @@ async def back_to_buy_main(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     if not await _current_purchase(callback, state):
         return
-    await state.update_data(service_type=None, volume_gb=None, volume_key=None, days=None,
+    await state.update_data(service_type=None, product_id=None, volume_gb=None, days=None,
         months=1, devices=MAX_DEVICES_DEFAULT, discount_id=None, discount_code=None, discount_percent=0)
     await _edit_callback(callback, state,
         f"{premium_emoji('shop', '●')} <b>نوع سرویس را انتخاب کن.</b>",
         buy_type_selection_keyboard())
 
 
-@router.callback_query(F.data.startswith("buy:vol:"))
-async def select_volume(callback: CallbackQuery, state: FSMContext):
+@router.callback_query(F.data.startswith("buy:prod:"))
+async def select_product(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     if not await _current_purchase(callback, state):
         return
     data = await state.get_data()
     service_type = data.get("service_type")
-    key = callback.data.rsplit(":", 1)[-1]
-    if service_type == SERVICE_VOLUME and key in VOLUME_OPTIONS:
-        volume = VOLUME_OPTIONS[key]
-    elif service_type == SERVICE_UNLIMITED and key in UNLIMITED_OPTIONS:
-        volume = UNLIMITED_OPTIONS[key]
-    else:
-        await _edit_callback(callback, state,
-            f"{premium_emoji('warning', '●')} <b>این پلن برای نوع سرویس انتخاب‌شده معتبر نیست.</b>",
-            buy_type_selection_keyboard())
+    try:
+        product_id = int(callback.data.rsplit(":", 1)[-1])
+    except (ValueError, TypeError):
+        await _edit_callback(callback, state, "شناسه محصول نامعتبر است.", buy_type_selection_keyboard())
         return
-    await state.update_data(volume_gb=volume, volume_key=key, devices=MAX_DEVICES_DEFAULT,
-        discount_id=None, discount_code=None, discount_percent=0)
-    if key == "unl_inf":
+    product = get_product(product_id)
+    if not product or not product.get("is_active"):
+        await _edit_callback(callback, state, "این محصول در دسترس نیست.", buy_type_selection_keyboard())
+        return
+    if not _valid_product_for_service(product, service_type):
+        await _edit_callback(callback, state, "این محصول برای نوع سرویس انتخاب‌شده معتبر نیست.", buy_type_selection_keyboard())
+        return
+
+    volume = float(product["volume_gb"])
+    await state.update_data(product_id=product_id, volume_gb=volume, volume_key=str(product_id),
+        devices=MAX_DEVICES_DEFAULT, discount_id=None, discount_code=None, discount_percent=0)
+
+    if product["kind"] == "unl" and volume <= 0:
+        # نامحدود بی‌نهایت: بدون انتخاب مدت
         await state.update_data(months=1, days=0)
         await _show_device_step(callback, state)
     else:
@@ -667,14 +816,22 @@ async def adjust_time(callback: CallbackQuery, state: FSMContext):
     if not await _current_purchase(callback, state):
         return
     data = await state.get_data()
-    if data.get("volume_key") == "unl_inf":
-        await _show_device_step(callback, state)
+    product_id = data.get("product_id")
+    product = get_product(int(product_id)) if product_id else None
+    if not product:
+        await _edit_callback(callback, state, "ابتدا محصول را انتخاب کن.", buy_type_selection_keyboard())
         return
-    if data.get("volume_key") not in VOLUME_OPTIONS and data.get("volume_key") != "unl150":
-        await _edit_callback(callback, state, "ابتدا پلن سرویس را انتخاب کن.", buy_type_selection_keyboard())
+    if product["kind"] == "unl" and float(product["volume_gb"]) <= 0:
+        await _show_device_step(callback, state)
         return
     action = callback.data.split(":")[2]
     months = max(1, min(MAX_MONTHS, int(data.get("months", 1))))
+    if action == "nolimit":
+        if product["kind"] != "vol":
+            return
+        await state.update_data(months=months, days=0)
+        await _show_device_step(callback, state)
+        return
     if action == "inc":
         months = min(MAX_MONTHS, months + 1)
     elif action == "dec":
@@ -682,7 +839,8 @@ async def adjust_time(callback: CallbackQuery, state: FSMContext):
     elif action == "noop":
         return
     elif action == "confirm":
-        await state.update_data(months=months, days=months * 30)
+        keep_nolimit = product["kind"] == "vol" and int(data.get("days", 30)) == 0
+        await state.update_data(months=months, days=0 if keep_nolimit else months * 30)
         await _show_device_step(callback, state)
         return
     else:
@@ -697,9 +855,11 @@ async def back_to_time(callback: CallbackQuery, state: FSMContext):
     if not await _current_purchase(callback, state):
         return
     data = await state.get_data()
-    if data.get("volume_key") == "unl_inf":
+    product_id = data.get("product_id")
+    product = get_product(int(product_id)) if product_id else None
+    if product and product["kind"] == "unl" and float(product["volume_gb"]) <= 0:
         await _show_device_step(callback, state)
-    elif data.get("volume_key"):
+    elif product:
         await _show_time_step(callback, state)
     else:
         await _edit_callback(callback, state, "ابتدا سرویس را انتخاب کن.", buy_type_selection_keyboard())
@@ -711,8 +871,8 @@ async def adjust_devices(callback: CallbackQuery, state: FSMContext):
     if not await _current_purchase(callback, state):
         return
     data = await state.get_data()
-    if not data.get("volume_key"):
-        await _edit_callback(callback, state, "ابتدا نوع و پلن سرویس را انتخاب کن.", buy_type_selection_keyboard())
+    if not data.get("product_id"):
+        await _edit_callback(callback, state, "ابتدا محصول را انتخاب کن.", buy_type_selection_keyboard())
         return
     action = callback.data.split(":")[2]
     devices = max(1, min(MAX_DEVICES, int(data.get("devices", MAX_DEVICES_DEFAULT))))
@@ -738,7 +898,7 @@ async def back_to_devices(callback: CallbackQuery, state: FSMContext):
     if not await _current_purchase(callback, state):
         return
     data = await state.get_data()
-    if not data.get("volume_key"):
+    if not data.get("product_id"):
         await _edit_callback(callback, state, "ابتدا سرویس را انتخاب کن.", buy_type_selection_keyboard())
     else:
         await _show_device_step(callback, state)
@@ -755,7 +915,7 @@ async def enter_discount(callback: CallbackQuery, state: FSMContext):
     await state.set_state(BuyStates.waiting_discount_code)
     await _edit_callback(callback, state,
         f"{premium_emoji('gift', '●')} <b>وارد کردن کد تخفیف</b>\n\nکد تخفیف را در یک پیام ارسال کن.\nبرای لغو /cancel را بفرست.",
-        _keyboard([[_button("بازگشت", "buy:discount", "shop")]]))
+        _keyboard([[_button("بازگشت", "buy:discount", "back")]]))
 
 
 @router.message(BuyStates.waiting_discount_code, F.text != "/cancel")
@@ -768,13 +928,13 @@ async def process_discount_code(message: Message, state: FSMContext):
         return
     if not rate_limiter.is_allowed(user.id):
         await _edit_user_message(message, state, "لطفاً کمی صبر کن و دوباره تلاش کن.",
-            _keyboard([[_button("بازگشت", "buy:discount", "shop")]]))
+            _keyboard([[_button("بازگشت", "buy:discount", "back")]]))
         return
     code_text = (message.text or "").strip().upper()
     if not validate_discount_code(code_text):
         await _edit_user_message(message, state,
             f"{premium_emoji('warning', '●')} <b>فرمت کد تخفیف معتبر نیست.</b>\nفقط حروف انگلیسی، عدد، خط تیره و زیرخط مجاز است.",
-            _keyboard([[_button("بازگشت", "buy:discount", "shop")]]))
+            _keyboard([[_button("بازگشت", "buy:discount", "back")]]))
         return
     try:
         code = get_discount_code(code_text)
@@ -785,7 +945,7 @@ async def process_discount_code(message: Message, state: FSMContext):
     if not code or not code.get("is_active") or int(code.get("used_count", 0)) >= int(code.get("max_uses", 0)):
         await _edit_user_message(message, state,
             f"{premium_emoji('warning', '●')} <b>کد تخفیف نامعتبر، غیرفعال یا تکمیل‌شده است.</b> دوباره ارسال کن.",
-            _keyboard([[_button("بازگشت", "buy:discount", "shop")]]))
+            _keyboard([[_button("بازگشت", "buy:discount", "back")]]))
         return
     await state.update_data(discount_code=code_text, discount_id=int(code["id"]), discount_percent=int(code["percent"]))
     await state.set_state(None)
@@ -838,17 +998,18 @@ async def pay_with_wallet(callback: CallbackQuery, state: FSMContext, paxiva: Pa
             await state.clear()
             return
         try:
-            price, _stars, _discount, _discount_id = _build_order_prices(data)
+            price_toman, _stars, _discount, _discount_id = _build_order_prices(data)
             balance = get_balance(user.id)
         except Exception:
             logger.exception("Could not validate payment")
+            send_alert("ERROR", f"خطای اعتبارسنجی پرداخت\nکاربر: {user.id}")
             await _edit_callback(callback, state, "بررسی مبلغ یا موجودی ناموفق بود. دوباره فاکتور بگیر.")
             return
-        if balance < price:
+        if balance < price_toman:
             await _edit_callback(callback, state,
                 f"{premium_emoji('wallet', '●')} <b>موجودی کیف پول کافی نیست.</b>\n\n"
-                f"موجودی فعلی: <b>{int(balance):,} تومان</b>\nمبلغ سفارش: <b>{price:,} تومان</b>\n\n"
-                "کیف پول را شارژ کن و دوباره تلاش کن.", purchase_retry_keyboard(price))
+                f"موجودی فعلی: <b>{int(balance):,} تومان</b>\nمبلغ سفارش: <b>{price_toman:,} تومان</b>\n\n"
+                "کیف پول را شارژ کن و دوباره تلاش کن.", purchase_retry_keyboard(price_toman))
             return
 
         await state.update_data(purchase_processing=True)
@@ -860,6 +1021,7 @@ async def pay_with_wallet(callback: CallbackQuery, state: FSMContext, paxiva: Pa
             _persist_pending_purchase(user.id, order_key, "processing")
         except Exception:
             logger.exception("Could not persist purchase lock before payment")
+            send_alert("ERROR", f"ذخیره قفل خرید ناموفق\nکاربر: {user.id}\norder: {order_key}")
             await _edit_callback(callback, state,
                 "ثبت امن سفارش در دیتابیس ناموفق بود؛ برای جلوگیری از کسر وجه، پرداخت انجام نشد.")
             await state.update_data(purchase_processing=False)
@@ -904,12 +1066,7 @@ async def pay_with_wallet(callback: CallbackQuery, state: FSMContext, paxiva: Pa
             idempotency_key=generate_idempotency_key(f"buy-{user.id}"))
         await _edit_callback(callback, state,
             f"{premium_emoji('warning', '●')} <b>{_safe_text(result)}</b>\n\nدر صورت کسر وجه، مبلغ به کیف پولت بازگردانده شده است.",
-            purchase_retry_keyboard(price))
-
-
-@router.callback_query(F.data == "buy:pay:stars")
-async def stars_payment_not_enabled(callback: CallbackQuery):
-    await callback.answer("پرداخت با Stars هنوز فعال نشده است. از کیف پول استفاده کن.", show_alert=True)
+            purchase_retry_keyboard(price_toman))
 
 
 @router.callback_query(F.data.startswith("buy:configs:"))
@@ -923,7 +1080,6 @@ async def send_all_subscription_configs(callback: CallbackQuery, paxiva: PaxivaC
         await callback.message.answer("شناسه اشتراک معتبر نیست.")
         return
     try:
-        # در نسخه بعدی paxiva.py این مسیر به متد عمومی get_client_configs منتقل می‌شود.
         getter = getattr(paxiva, "get_client_configs", None)
         if callable(getter):
             response = await getter(client_id)
@@ -953,6 +1109,7 @@ async def send_all_subscription_configs(callback: CallbackQuery, paxiva: PaxivaC
             await callback.message.answer("هیچ لینک کانفیگ معتبری در پاسخ پنل نبود.")
     except Exception:
         logger.exception("Could not retrieve PAXIVA configs for client %s", client_id)
+        send_alert("ERROR", f"دریافت کانفیگ‌ها از پنل ناموفق\nکاربر: {callback.from_user.id}\nclient_id: {client_id}")
         await callback.message.answer(
             f"{premium_emoji('warning', '●')} دریافت کانفیگ‌ها از پنل ناموفق بود. کمی بعد دوباره تلاش کن.")
 
